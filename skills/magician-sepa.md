@@ -24,8 +24,8 @@
 ```
 第一层：趋势筛选（magician-trend-screen）   趋势模板 8 条 + 第二阶段 + RS≥70
         ↓ 任一硬性否决即排除
-第二层：成长基本面（magician-growth-fundamental）  净利润加速 + 催化剂 + 领头羊
-        ↓ 否决即排除；存疑需人工复核
+第二层：成长基本面（magician-growth-fundamental）  量化硬规则（质量红线+营收同比≥15%，P1校准）+ 催化剂 + 领头羊
+        ↓ 否决即排除；存疑需人工复核（可用 tools/magician_fundamental.py funnel 批量回测/筛选）
 第三层：VCP 买点（magician-vcp-entry）     收缩递减 + 量能萎缩 + 中枢点
         ↓ 无 VCP 结构 → 进入观察池，不追高
 第四层：仓位风控（magician-risk-position） 单笔风险 1.25-2.5%、组合 4-8 只

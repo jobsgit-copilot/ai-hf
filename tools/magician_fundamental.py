@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""magician_fundamental.py — P1 基本面漏斗：点在时间快照 + 回测裁量边际增益
+
+用法：
+    python magician_fundamental.py funnel --events <events.json> --cache <live_cache.pkl> \
+        --indicator finance_indicator.pkl --income finance_income.pkl \
+        --basic stock_basic.pkl --pb finance_pb_weekly.pkl \
+        --stops 7 --rrs 2 3 --mcs 2 3 --rs-min-list 0 90 --dry 0 1 --out report.md
+
+规则源：magician-growth-fundamental（营收同比/加速）+ quality-screen 去劣 7 条的可量化部分
+（负债率/现金流/毛利率/ST）。所有条件按 ann_date 做 point-in-time 对齐，禁止未来函数。
+"""
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import magician_backtest as MB  # noqa: E402
+
+DEFAULT_SQUEEZE = r"D:\Users\Documents\AI-Finance\squeeze"
+RULE_DEBT_MAX = 85.0       # 资产负债率上限（%）
+RULE_OCF_MIN = 0.7         # 经营现金流/净利润下限
+RULE_GPM_MIN = 15.0        # 长期毛利率下限（%）
+RULE_ROE_MIN = 8.0         # ROE 下限（%，年度均值）
+RULE_REV_YOY_MIN = 15.0    # 营收同比下限（%）
+RULE_PB_PCT_MAX = 90.0     # PB 自身历史分位上限（%）
+
+
+def _norm_code(c):
+    c = str(c)
+    if "." in c:
+        return c.upper()
+    return c
+
+
+class FundamentalDB:
+    """全市场 point-in-time 财务快照：按代码预处理，事件时等价查询。"""
+
+    def __init__(self, indicator_pkl, income_pkl, basic_pkl, pb_pkl=None):
+        t0 = time.time()
+        ind = pd.read_pickle(indicator_pkl)
+        inc = pd.read_pickle(income_pkl)
+        basic = pd.read_pickle(basic_pkl)
+        self._basic = {}
+        for r in basic.itertuples(index=False):
+            name = str(getattr(r, "name") or "")
+            self._basic[_norm_code(r.ts_code)] = {
+                "is_st": "ST" in name.upper(),
+                "delisted": pd.notna(getattr(r, "delist_date", None)),
+            }
+
+        ind["ts_code"] = ind["ts_code"].map(_norm_code)
+        ind["ann_date"] = pd.to_datetime(ind["ann_date"])
+        ind["end_date"] = pd.to_datetime(ind["end_date"])
+        ind = ind.drop_duplicates(["ts_code", "end_date", "ann_date"]).sort_values(["ts_code", "ann_date", "end_date"])
+        self._ind = {}
+        for c, g in ind.groupby("ts_code", sort=False):
+            self._ind[c] = {
+                "ann": g["ann_date"].to_numpy(dtype="datetime64[ns]"),
+                "roe": g["roe"].to_numpy(dtype=float),
+                "gpm": g["grossprofit_margin"].to_numpy(dtype=float),
+                "dta": g["debt_to_assets"].to_numpy(dtype=float),
+                "ocf": g["ocf_to_profit"].to_numpy(dtype=float),
+                "end": g["end_date"].to_numpy(dtype="datetime64[ns]"),
+            }
+
+        inc["ts_code"] = inc["ts_code"].map(_norm_code)
+        inc["ann_date"] = pd.to_datetime(inc["ann_date"])
+        inc["end_date"] = pd.to_datetime(inc["end_date"].astype(str).str[:8], format="%Y%m%d")
+        inc = inc.drop_duplicates(["ts_code", "end_date", "ann_date"]).sort_values(["ts_code", "end_date", "ann_date"])
+        self._inc = {}
+        for c, g in inc.groupby("ts_code", sort=False):
+            self._inc[c] = {
+                "ann": g["ann_date"].to_numpy(dtype="datetime64[ns]"),
+                "end": g["end_date"].to_numpy(dtype="datetime64[ns]"),
+                "rev": g["revenue"].to_numpy(dtype=float),
+            }
+
+        self._pb = None
+        if pb_pkl:
+            pb = pd.read_pickle(pb_pkl)
+            pb["ts_code"] = pb["ts_code"].map(_norm_code)
+            pb["trade_date"] = pd.to_datetime(pb["trade_date"])
+            pb = pb.drop_duplicates(["ts_code", "trade_date"]).sort_values(["ts_code", "trade_date"])
+            self._pb = {}
+            for c, g in pb.groupby("ts_code", sort=False):
+                self._pb[c] = {"date": g["trade_date"].to_numpy(dtype="datetime64[ns]"),
+                               "pb": g["pb"].to_numpy(dtype=float)}
+        print(f"财务快照库构建完成：{len(self._ind)}只指标 / "
+              f"{len(self._inc)}只收入 / {len(self._basic)}只基本面（{time.time()-t0:.1f}s）")
+
+    def snapshot(self, code, date):
+        d = np.datetime64(date)
+        out = {"code": code, "date": str(date)[:10],
+               "has_ind": False, "roe_latest": None, "roe_annual_avg": None,
+               "gpm_avg": None, "dta_latest": None, "ocf_med": None,
+               "has_inc": False, "rev_yoy": None, "rev_yoy_prev": None,
+               "is_st": False, "delisted": False, "pb_pct": None}
+
+        b = self._basic.get(code)
+        if b:
+            out["is_st"] = b["is_st"]
+            out["delisted"] = b["delisted"]
+
+        g = self._ind.get(code)
+        if g is not None:
+            idx = int(np.searchsorted(g["ann"], d, side="right") - 1)
+            if idx >= 0:
+                n = idx + 1
+                with np.errstate(invalid="ignore"):
+                    out["has_ind"] = True
+                    out["roe_latest"] = float(g["roe"][idx]) if g["roe"][idx] == g["roe"][idx] else None
+                    ann_mask = g["end"][:n].astype("datetime64[M]").astype(int) % 12 == 11
+                    ann_roe = g["roe"][:n][ann_mask]
+                    out["roe_annual_avg"] = float(np.nanmean(ann_roe)) if np.isfinite(ann_roe).any() else None
+                    out["gpm_avg"] = float(np.nanmean(g["gpm"][:n])) if np.isfinite(g["gpm"][:n]).any() else None
+                    out["dta_latest"] = float(g["dta"][idx]) if g["dta"][idx] == g["dta"][idx] else None
+                    ocf = g["ocf"][:n]
+                    out["ocf_med"] = float(np.nanmedian(ocf)) if np.isfinite(ocf).any() else None
+
+        gi = self._inc.get(code)
+        if gi is not None:
+            ann, end, rev = gi["ann"], gi["end"], gi["rev"]
+            cand = np.nonzero(ann <= d)[0]
+            if len(cand):
+                # 最新已披露报表期
+                li = cand[np.argmax(end[cand])]
+                out["has_inc"] = True
+                last_end = end[li]
+                prev_end = last_end - np.timedelta64(365, "D")
+                pprev_end = last_end - np.timedelta64(730, "D")
+                yoy = self._rev_at(gi, last_end, d)
+                yoy_prev_end = last_end - np.timedelta64(91, "D")
+                if yoy is not None:
+                    y0 = self._rev_at(gi, prev_end, d)
+                    if y0 and y0 > 0:
+                        out["rev_yoy"] = float((yoy / y0 - 1) * 100)
+                if out["rev_yoy"] is not None:
+                    y1 = self._rev_at(gi, yoy_prev_end, d)
+                    y0 = self._rev_at(gi, pprev_end, d)
+                    if y1 and y0 and y0 > 0:
+                        out["rev_yoy_prev"] = float((y1 / y0 - 1) * 100)
+
+        gp = self._pb.get(code) if self._pb else None
+        if gp is not None:
+            idx = int(np.searchsorted(gp["date"], d, side="right") - 1)
+            if idx >= 0:
+                cur = gp["pb"][idx]
+                if cur == cur:
+                    hist = gp["pb"][:idx + 1]
+                    hist = hist[np.isfinite(hist)]
+                    if len(hist):
+                        out["pb_pct"] = float((hist < cur).mean() * 100)
+        return out
+
+    @staticmethod
+    def _rev_at(gi, end, d):
+        end_dates = gi["end"]
+        m = np.nonzero(end_dates == end)[0]
+        for i in m:
+            if gi["ann"][i] <= d:
+                v = gi["rev"][i]
+                return float(v) if v == v else None
+        return None
+
+
+def apply_rules(snap):
+    """返回各规则判定：pass/fail/na。质量红线 na=放行；成长条件 na=不通过。"""
+    rules = {}
+    rules["r_st"] = "pass" if not (snap["is_st"] or snap["delisted"]) else "fail"
+    d = snap["dta_latest"]
+    rules["r_debt"] = "pass" if d is None or d <= RULE_DEBT_MAX else "fail"
+    o = snap["ocf_med"]
+    rules["r_ocf"] = "pass" if o is None or o >= RULE_OCF_MIN else "fail"
+    m = snap["gpm_avg"]
+    rules["r_gpm"] = "pass" if m is None or m >= RULE_GPM_MIN else "fail"
+    r = snap["roe_annual_avg"]
+    rules["r_roe"] = "pass" if r is None or r >= RULE_ROE_MIN else "fail"
+    y = snap["rev_yoy"]
+    rules["g_rev"] = "pass" if y is not None and y >= RULE_REV_YOY_MIN else "fail"
+    yp = snap["rev_yoy_prev"]
+    rules["g_accel"] = "pass" if y is not None and yp is not None and y >= yp else "fail"
+    p = snap["pb_pct"]
+    rules["v_pb"] = "pass" if p is None or p <= RULE_PB_PCT_MAX else "fail"
+    return rules
+
+
+def funnel_level(rules):
+    """漏斗分级：F0 全量 / F1 质量红线 / F2 +F1收入同比 / F3 +F2加速 / F4 +F2 PB分位"""
+    f1 = all(rules[k] != "fail" for k in ("r_st", "r_debt", "r_ocf", "r_gpm", "r_roe"))
+    f2 = f1 and rules["g_rev"] == "pass"
+    f3 = f2 and rules["g_accel"] == "pass"
+    f4 = f2 and rules["v_pb"] != "fail"
+    return {"F0": True, "F1": f1, "F2": f2, "F3": f3, "F4": f4}
+
+
+def cmd_funnel(args):
+    events = json.loads(Path(args.events).read_text(encoding="utf-8"))
+    df = MB.load_cache(args.cache)
+    arrays = MB.build_arrays(df)
+
+    db = FundamentalDB(args.indicator, args.income, args.basic,
+                       args.pb if Path(args.pb).exists() else None)
+    t0 = time.time()
+    n_rule = {"r_st": 0, "r_debt": 0, "r_ocf": 0, "r_gpm": 0, "r_roe": 0,
+              "g_rev": 0, "g_accel": 0, "v_pb": 0}
+    n_snap = 0
+    levels = {"F0": 0, "F1": 0, "F2": 0, "F3": 0, "F4": 0}
+    for ev in events:
+        snap = db.snapshot(ev["code"], ev["date"])
+        rules = apply_rules(snap)
+        ev["snap"] = snap
+        ev["funnel"] = funnel_level(rules)
+        n_snap += 1
+        for k in n_rule:
+            n_rule[k] += (rules[k] == "pass")
+        for k in levels:
+            levels[k] += bool(ev["funnel"][k])
+    print(f"快照完成：{n_snap} 个事件（{time.time()-t0:.0f}s）")
+    print(f"  各规则通过率：" + "  ".join(f"{k}={n_rule[k]}/{n_snap} ({n_rule[k]/max(1,n_snap)*100:.0f}%)" for k in n_rule))
+    print(f"  漏斗分级通过：" + "  ".join(f"{k}={v}" for k, v in levels.items()))
+
+    groups = {k: [e for e in events if e["funnel"][k]] for k in ("F0", "F1", "F2", "F3", "F4")}
+    configs = []
+    for stop_pct in args.stops:
+        for rr in args.rrs:
+            for mc in args.mcs:
+                for rs_min in args.rs_min_list:
+                    for brv in args.brv:
+                        for dry in args.dry:
+                            configs.append({"stop_pct": stop_pct, "rr": rr, "min_contractions": mc,
+                                            "rs_min": rs_min, "require_stage2": True,
+                                            "entry": "breakout", "max_ext": 0.15,
+                                            "require_brv": bool(brv), "require_dry": bool(dry)})
+
+    rows = []
+    for cfg in configs:
+        label = MB._config_label(cfg)
+        for gname, evs in groups.items():
+            trades, s = MB.measure(evs, arrays, cfg, horizon=args.horizon)
+            rows.append({"level": gname, "config": label, "n": s["n"], "win_rate": s["win_rate"],
+                         "avg_win": s["avg_win"], "avg_loss": s["avg_loss"],
+                         "expectancy_pct": s["expectancy_pct"], "median_outcome": s["median_outcome"],
+                         "hit20_rate": s["hit20_rate"]})
+
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return
+
+    print("\n=== 基本面漏斗回测（按期望降序）===")
+    print(f"{'漏斗':<6}{'配置':<38}{'笔数':>6}{'胜率%':>7}{'均盈%':>7}{'均亏%':>7}{'期望%':>8}{'中位%':>8}{'先+20%':>7}")
+    for r in sorted(rows, key=lambda x: -(x["expectancy_pct"] or -999)):
+        exp = "-" if r["expectancy_pct"] is None else f"{r['expectancy_pct']:>8.2f}"
+        print(f"{r['level']:<6}{r['config']:<38}{r['n']:>6}{str(r['win_rate']):>7}{str(r['avg_win']):>7}"
+              f"{str(r['avg_loss']):>7}{exp}{str(r['median_outcome']):>8}{str(r['hit20_rate']):>7}")
+
+    if args.out:
+        out_path = Path(args.out)
+        rep = [f"# VCP 策略基本面漏斗回测（P1，{args.start_hint}）",
+               "",
+               f"> 事件：{len(events)} 个；各规则通过率：" + "  ".join(f"{k}={n_rule[k]}" for k in n_rule),
+               f"> 漏斗分级：" + "  ".join(f"{k}={v}" for k, v in levels.items()),
+               f"> 规则：质量红线（ST/资产负债率≤{RULE_DEBT_MAX:.0f}%/现金流利润比≥{RULE_OCF_MIN}/毛利率≥{RULE_GPM_MIN:.0f}%/ROE≥{RULE_ROE_MIN:.0f}%）；成长：营收同比≥{RULE_REV_YOY_MIN:.0f}% 且加速；估值：PB自身分位≤{RULE_PB_PCT_MAX:.0f}%（PB 仅 2021+ 有数据）",
+               "",
+               "| 漏斗 | 配置 | 笔数 | 胜率% | 均盈% | 均亏% | 期望% | 中位% | 先达+20% |",
+               "|---|---|---|---|---|---|---|---|---|---|"]
+        for r in sorted(rows, key=lambda x: -(x["expectancy_pct"] or -999)):
+            rep.append(f"| {r['level']} | {r['config']} | {r['n']} | {r['win_rate']} | {r['avg_win']} | "
+                       f"{r['avg_loss']} | {r['expectancy_pct']} | {r['median_outcome']} | {r['hit20_rate']} |")
+        out_path.write_text("\n".join(rep), encoding="utf-8")
+        print(f"报告已保存: {out_path}")
+
+
+def _reconfigure_stdout():
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+
+def main():
+    _reconfigure_stdout()
+    parser = argparse.ArgumentParser(description="股票魔法师 P1 基本面漏斗回测")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("funnel", help="基本面漏斗裁量边际增益")
+    p.add_argument("--events", required=True, help="事件 JSON（magician_backtest --dump-events）")
+    p.add_argument("--cache", default=MB.DEFAULT_CACHE)
+    p.add_argument("--indicator", default=Path(DEFAULT_SQUEEZE) / "finance_indicator.pkl")
+    p.add_argument("--income", default=Path(DEFAULT_SQUEEZE) / "finance_income.pkl")
+    p.add_argument("--basic", default=Path(DEFAULT_SQUEEZE) / "stock_basic.pkl")
+    p.add_argument("--pb", default=str(Path(DEFAULT_SQUEEZE) / "finance_pb_weekly.pkl"))
+    p.add_argument("--stops", type=float, nargs="+", default=[7.0])
+    p.add_argument("--rrs", type=float, nargs="+", default=[3.0])
+    p.add_argument("--mcs", type=int, nargs="+", default=[2, 3])
+    p.add_argument("--rs-min-list", type=float, nargs="+", default=[0.0])
+    p.add_argument("--brv", type=int, nargs="+", choices=[0, 1], default=[0])
+    p.add_argument("--dry", type=int, nargs="+", choices=[0, 1], default=[0, 1])
+    p.add_argument("--horizon", type=int, default=60)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--out", default="")
+    p.add_argument("--start-hint", default="2020-01~2026-08，日度评估")
+    p.set_defaults(func=cmd_funnel)
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -25,7 +25,7 @@ def make_arrays(code="TEST.SH", n=600, end="2026-04-01", price=50.0):
     low = close - 1.0
     return {code: (dates.to_numpy(dtype="datetime64[ns]"),
                    (close - 0.3).astype(float), high.astype(float), low.astype(float),
-                   close.astype(float), np.full(n, 2e8, dtype=float))}
+                   close.astype(float), np.full(n, 2e8, dtype=float), np.full(n, 1e6, dtype=float))}
 
 
 def base_event(code="TEST.SH", date="2026-01-05", entry=100.0, pivot=100.0):
@@ -41,7 +41,7 @@ CFG = {"stop_pct": 7, "rr": 3, "min_contractions": 2, "rs_min": 0,
 class TestMeasure(unittest.TestCase):
     def test_win_target(self):
         arrays = make_arrays()
-        code, (dates, o, h, l, c, amt) = list(arrays.items())[0]
+        code, (dates, o, h, l, c, vol, amt) = list(arrays.items())[0]
         i = int(np.searchsorted(dates, np.datetime64("2026-01-05")))
         c[i] = 100.0  # 事件日收盘 = 入场价
         for k in range(i + 1, len(dates)):  # 事件日后一路上涨
@@ -57,7 +57,7 @@ class TestMeasure(unittest.TestCase):
 
     def test_stop_loss(self):
         arrays = make_arrays()
-        code, (dates, o, h, l, c, amt) = list(arrays.items())[0]
+        code, (dates, o, h, l, c, vol, amt) = list(arrays.items())[0]
         i = int(np.searchsorted(dates, np.datetime64("2026-01-05")))
         c[i] = 100.0  # 事件日收盘 = 入场价
         for k in range(i + 1, len(dates)):  # 事件日后持续下跌
@@ -95,6 +95,31 @@ class TestMeasure(unittest.TestCase):
         s = MB.summarize([])
         self.assertEqual(s["n"], 0)
         self.assertIsNone(s["expectancy_pct"])
+
+    def test_breakout_volume_filter(self):
+        arrays = make_arrays()
+        ev = base_event()
+        ev["breakout_volume_confirmed"] = False
+        cfg = dict(CFG, require_brv=True)
+        trades, s = MB.measure([ev], arrays, cfg)
+        self.assertEqual(len(trades), 0)
+
+    def test_volume_dry_filter(self):
+        arrays = make_arrays()
+        ev = base_event()
+        ev["volume_dry"] = False
+        cfg = dict(CFG, require_dry=True)
+        trades, s = MB.measure([ev], arrays, cfg)
+        self.assertEqual(len(trades), 0)
+
+    def test_volume_filters_pass_when_ok(self):
+        arrays = make_arrays()
+        ev = base_event()
+        ev["volume_dry"] = True
+        ev["breakout_volume_confirmed"] = True
+        cfg = dict(CFG, require_brv=True, require_dry=True)
+        trades, s = MB.measure([ev], arrays, cfg)
+        self.assertEqual(len(trades), 1)
 
 
 if __name__ == "__main__":

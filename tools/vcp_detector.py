@@ -30,13 +30,21 @@ sys.path.insert(0, str(TOOLS_DIR))
 
 import magician_data as md  # noqa: E402
 
+try:
+    import numpy as np
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    _HAS_NP = True
+except ImportError:  # 无 numpy 环境使用纯标准库回退
+    _HAS_NP = False
+
 DEFAULT_DAYS = 60          # 基底分析窗口（交易日，约 12 周）
 DEFAULT_K = 3              # 摆动低点/高点局部邻域半径
 MIN_GAP = 5                # 两个摆动低点的最小间隔（交易日）
 MIN_DEPTH_PCT = 2.0        # 有效收缩的最小深度（%）
 MAX_DEPTH_PCT = 50.0       # 收缩最大深度（超过视为崩溃而非基底）
 DEPTH_TOL = 1.05           # 相邻收缩深度允许的松弛系数（须递减）
-VOL_TOL = 1.15             # 末段量能相对首段允许的上浮系数（须收缩）
+VOL_TOL = 0.60             # 末段量能首段的上限系数（量能萎缩：末段 <= 首段*0.6，与设计文档一致）
 BREAK_VOL_MULT = 1.5       # 突破日量能 vs 20日均量的倍数（量能确认）
 
 
@@ -52,8 +60,16 @@ def _reconfigure_stdout():
 def swing_lows(bars, k=DEFAULT_K):
     """返回摆动低点索引列表（low 为 ±k 邻域内最低）。"""
     lows = [b["low"] for b in bars]
+    n = len(lows)
+    if n <= 2 * k:
+        return []
+    if _HAS_NP:
+        a = np.asarray(lows, dtype=float)
+        w = sliding_window_view(a, 2 * k + 1)
+        idx = np.flatnonzero(w[:, k] <= w.min(axis=1)) + k
+        return [int(i) for i in idx]
     out = []
-    for i in range(k, len(bars) - k):
+    for i in range(k, n - k):
         if all(lows[i] <= lows[j] for j in range(i - k, i + k + 1) if j != i):
             out.append(i)
     return out
@@ -62,8 +78,16 @@ def swing_lows(bars, k=DEFAULT_K):
 def swing_highs(bars, k=DEFAULT_K):
     """返回摆动高点索引列表（high 为 ±k 邻域内最高）。"""
     highs = [b["high"] for b in bars]
+    n = len(highs)
+    if n <= 2 * k:
+        return []
+    if _HAS_NP:
+        a = np.asarray(highs, dtype=float)
+        w = sliding_window_view(a, 2 * k + 1)
+        idx = np.flatnonzero(w[:, k] >= w.max(axis=1)) + k
+        return [int(i) for i in idx]
     out = []
-    for i in range(k, len(bars) - k):
+    for i in range(k, n - k):
         if all(highs[i] >= highs[j] for j in range(i - k, i + k + 1) if j != i):
             out.append(i)
     return out

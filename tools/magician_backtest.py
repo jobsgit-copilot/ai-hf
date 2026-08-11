@@ -48,16 +48,22 @@ def load_cache(path):
 
 
 def build_arrays(df):
-    """返回 {code: (dates, open, high, low, close, amount)}，全部为 numpy 数组（升序）。"""
+    """返回 {code: (dates, open, high, low, close, volume, amount)}，numpy 数组（升序）。
+
+    无成交量列的数据源 volume=None（成交量确认类指标不可用）。
+    """
+    has_vol = "volume" in df.columns
     arrays = {}
     for code, g in df.groupby("code", sort=False):
         g = g.sort_values("date")
+        vol = g["volume"].to_numpy(dtype=float) if has_vol else None
         arrays[code] = (
             g["date"].to_numpy(),
             g["open"].to_numpy(dtype=float),
             g["high"].to_numpy(dtype=float),
             g["low"].to_numpy(dtype=float),
             g["close"].to_numpy(dtype=float),
+            vol,
             g["amount"].to_numpy(dtype=float),
         )
     return arrays
@@ -66,7 +72,7 @@ def build_arrays(df):
 def select_universe(arrays, min_amount=MIN_AMOUNT, lookback=60):
     """按近 lookback 日平均成交额筛选，并剔除历史不足的标的。返回 (codes, min_rows)。"""
     out = []
-    for code, (dates, o, h, l, c, amt) in arrays.items():
+    for code, (dates, o, h, l, c, vol, amt) in arrays.items():
         if len(dates) < WARMUP_BARS + WINDOW_DAYS:
             continue
         avg = amt[-lookback:].mean() if len(amt) >= lookback else amt.mean()
@@ -88,23 +94,26 @@ def sample_dates(global_dates, start, end, step):
 def rs_percentiles(df, eval_dates, windows=(252, 126, 63)):
     """对每个评估日预计算全市场横截面 N 日涨幅分位（0-99）。
 
+    透视表向量化：一次 pivot 后仅做列切片，避免逐日全表过滤。
     返回 {window: {date_str: {code: pct}}}。
     """
     dates_all = pd.Series(df["date"].unique()).sort_values().to_numpy()
+    close_pivot = df.pivot_table(index="code", columns="date", values="close")
     out = {w: {} for w in windows}
-    pos = {d: int(np.searchsorted(dates_all, d)) for d in eval_dates}
     for w in windows:
         for d in eval_dates:
-            p = pos[d]
+            p = int(np.searchsorted(dates_all, d))
             s = p - w
             if s < 0:
                 continue
-            d0, d1 = dates_all[s], d
-            c0 = df[df["date"] == d0].set_index("code")["close"]
-            c1 = df[df["date"] == d1].set_index("code")["close"]
-            common = c0.index.intersection(c1.index)
-            ret = c1[common] / c0[common] - 1
-            ret = ret[np.isfinite(ret)]
+            d0 = pd.Timestamp(dates_all[s])
+            d1 = pd.Timestamp(d)
+            if d0 not in close_pivot.columns or d1 not in close_pivot.columns:
+                continue
+            c0 = close_pivot[d0]
+            c1 = close_pivot[d1]
+            common = c0.notna() & c1.notna()
+            ret = (c1[common] / c0[common] - 1).dropna()
             if ret.empty:
                 continue
             pct = (ret.rank(pct=True) * 99).round(1)
@@ -114,8 +123,65 @@ def rs_percentiles(df, eval_dates, windows=(252, 126, 63)):
 
 # ---------------------------------------------------------------- 事件检测
 
-def detect_events(arrays, universe, eval_dates, progress=True):
-    """对每个评估日×标的运行 VCP 检测，收集全部事件（含结构性字段）。"""
+def _detect_chunk(payload):
+    """多进程工作函数：处理一个股票分块，返回该块的全部 VCP 事件。"""
+    arrays, universe, eval_dates = payload
+    events = []
+    for d in eval_dates:
+        d_str = str(d)[:10]
+        for code in universe:
+            dates, o, h, l, c, vol, amt = arrays[code]
+            end_pos = int(np.searchsorted(dates, d, side="right") - 1)
+            if end_pos < WARMUP_BARS:
+                continue
+            start_pos = end_pos - (WARMUP_BARS - 1)
+            bars = []
+            for i in range(start_pos, end_pos + 1):
+                bars.append({"date": str(dates[i])[:10], "open": float(o[i]), "high": float(h[i]),
+                             "low": float(l[i]), "close": float(c[i]),
+                             "volume": float(vol[i]) if vol is not None else None,
+                             "amount": float(amt[i])})
+            try:
+                r = VD.analyze_vcp(bars, window_days=WINDOW_DAYS, min_contractions=2)
+            except Exception:
+                continue
+            if not r["has_vcp"]:
+                continue
+            events.append({
+                "code": code,
+                "date": d_str,
+                "status": r["status"],
+                "pivot": r["pivot"],
+                "base_low": r["base_low"],
+                "entry": float(c[end_pos]),
+                "depths": r["depths"],
+                "n_contractions": len(r["depths"]),
+                "footprint": r["footprint"],
+                "stage": r["stage_context"],
+                "volume_dry": r["volume_dry"],
+                "breakout_volume_confirmed": r["breakout_volume_confirmed"],
+            })
+    return events
+
+
+def detect_events(arrays, universe, eval_dates, progress=True, workers=1):
+    """对每个评估日×标的运行 VCP 检测，收集全部事件（含结构性字段）。
+
+    workers>1 时按股票分块多进程并行（结果与串行一致）。
+    """
+    if workers > 1 and len(universe) > workers:
+        import multiprocessing as mp
+        chunks = np.array_split(np.asarray(universe, dtype=object), workers)
+        payloads = [({c: arrays[c] for c in chunk.tolist()}, chunk.tolist(), eval_dates)
+                    for chunk in chunks]
+        t0 = time.time()
+        with mp.Pool(workers) as pool:
+            results = pool.map(_detect_chunk, payloads)
+        events = [e for r in results for e in r]
+        print(f"并行检测完成：{len(events)} 个 VCP 事件（{workers} workers，"
+              f"已用 {time.time()-t0:.0f}s）", flush=True)
+        return events
+
     events = []
     total = len(universe) * len(eval_dates)
     done = 0
@@ -123,7 +189,7 @@ def detect_events(arrays, universe, eval_dates, progress=True):
     for d in eval_dates:
         d_str = str(d)[:10]
         for code in universe:
-            dates, o, h, l, c, amt = arrays[code]
+            dates, o, h, l, c, vol, amt = arrays[code]
             end_pos = int(np.searchsorted(dates, d, side="right") - 1)
             if end_pos < WARMUP_BARS:
                 done += 1
@@ -132,7 +198,8 @@ def detect_events(arrays, universe, eval_dates, progress=True):
             bars = []
             for i in range(start_pos, end_pos + 1):
                 bars.append({"date": str(dates[i])[:10], "open": float(o[i]), "high": float(h[i]),
-                             "low": float(l[i]), "close": float(c[i]), "volume": None,
+                             "low": float(l[i]), "close": float(c[i]),
+                             "volume": float(vol[i]) if vol is not None else None,
                              "amount": float(amt[i])})
             try:
                 r = VD.analyze_vcp(bars, window_days=WINDOW_DAYS, min_contractions=2)
@@ -153,6 +220,8 @@ def detect_events(arrays, universe, eval_dates, progress=True):
                 "n_contractions": len(r["depths"]),
                 "footprint": r["footprint"],
                 "stage": r["stage_context"],
+                "volume_dry": r["volume_dry"],
+                "breakout_volume_confirmed": r["breakout_volume_confirmed"],
             })
             done += 1
         if progress:
@@ -176,6 +245,8 @@ def measure(events, arrays, config, horizon=60, target20=0.20):
     require_stage2 = config.get("require_stage2", True)
     entry_mode = config.get("entry", "breakout")
     max_ext = config.get("max_ext", 0.15)
+    require_brv = config.get("require_brv", False)
+    require_dry = config.get("require_dry", False)
 
     trades = []
     last_entry_idx = {}  # code -> 上一次已接受建仓的全局 bar 索引
@@ -191,13 +262,17 @@ def measure(events, arrays, config, horizon=60, target20=0.20):
                 continue
             if ev["entry"] > ev["pivot"] * (1 + max_ext):
                 continue
+            if require_brv and not ev.get("breakout_volume_confirmed"):
+                continue
+            if require_dry and ev.get("volume_dry") is not True:
+                continue
         else:  # setup：接近中枢点（95%-100%）
             if ev["status"] not in ("setup", "breakout"):
                 continue
             if ev["entry"] < ev["pivot"] * 0.95 or ev["entry"] > ev["pivot"]:
                 continue
 
-        dates, o, h, l, c, amt = arrays[ev["code"]]
+        dates, o, h, l, c, vol, amt = arrays[ev["code"]]
         i = int(np.searchsorted(dates, np.datetime64(ev["date"]), side="right") - 1)
         if i < 0 or i + 1 >= len(dates):
             continue
@@ -280,7 +355,8 @@ def summarize(trades):
 def _config_label(cfg):
     return (f"stop{cfg['stop_pct']}%_rr{cfg['rr']}_mc{cfg.get('min_contractions', 2)}"
             f"_rs{cfg.get('rs_min', 0)}_s2{int(cfg.get('require_stage2', True))}"
-            f"_x{int(round(cfg.get('max_ext', 0.15) * 100))}_{cfg.get('entry', 'breakout')}")
+            f"_x{int(round(cfg.get('max_ext', 0.15) * 100))}_bv{int(cfg.get('require_brv', False))}"
+            f"_dy{int(cfg.get('require_dry', False))}_{cfg.get('entry', 'breakout')}")
 
 
 def run_engine(events, arrays, configs, horizon=60):
@@ -306,7 +382,7 @@ def cmd_run(args):
     if rs:
         print("RS 分位预计算完成（252/126/63 日）")
 
-    events = detect_events(arrays, universe, eval_dates)
+    events = detect_events(arrays, universe, eval_dates, workers=args.workers)
     print(f"检测完成：{len(events)} 个 VCP 事件")
 
     # 附加 RS 分位（主：252，回退 126/63）
@@ -326,7 +402,9 @@ def cmd_run(args):
     configs = [{"stop_pct": args.stop_pct, "rr": args.rr,
                 "min_contractions": args.min_contractions,
                 "rs_min": args.rs_min, "require_stage2": args.require_stage2,
-                "entry": args.entry, "max_ext": args.max_ext}]
+                "entry": args.entry, "max_ext": args.max_ext,
+                "require_brv": args.require_brv,
+                "require_dry": args.require_dry}]
     results = run_engine(events, arrays, configs, horizon=args.horizon)
 
     if args.json:
@@ -359,7 +437,7 @@ def cmd_sweep(args):
         eval_dates = sample_dates(global_dates, args.start, args.end, args.step)
         print(f"标的池 {len(universe)}，评估日 {len(eval_dates)}")
         rs = rs_percentiles(df, eval_dates)
-        events = detect_events(arrays, universe, eval_dates)
+        events = detect_events(arrays, universe, eval_dates, workers=args.workers)
         for ev in events:
             ev["rs"] = None
             for w in (252, 126, 63):
@@ -381,10 +459,13 @@ def cmd_sweep(args):
                     for rs_min in args.rs_min_list:
                         for s2 in args.stage2:
                             for x in args.max_exts:
-                                configs.append({"stop_pct": stop_pct, "rr": rr,
-                                                "min_contractions": mc, "rs_min": rs_min,
-                                                "require_stage2": s2, "entry": entry,
-                                                "max_ext": x})
+                                for brv in args.brv:
+                                    for dry in args.dry:
+                                        configs.append({"stop_pct": stop_pct, "rr": rr,
+                                                        "min_contractions": mc, "rs_min": rs_min,
+                                                        "require_stage2": s2, "entry": entry,
+                                                        "max_ext": x, "require_brv": bool(brv),
+                                                        "require_dry": bool(dry)})
     results = run_engine(events, arrays, configs, horizon=args.horizon)
 
     rows = []
@@ -423,6 +504,49 @@ def _reconfigure_stdout():
         pass
 
 
+def cmd_cache(args):
+    """从 xtquant 拉取全市场前复权日线（含成交量），构建回测数据缓存。"""
+    try:
+        from xtquant import xtdata
+    except Exception as e:
+        raise RuntimeError(f"需要 ai2miniqmt 虚拟环境（xtquant）：{e}") from e
+    xtdata.enable_hello = False
+    stocks = xtdata.get_stock_list_in_sector("沪深A股")
+    if not stocks:
+        raise RuntimeError("未获取到沪深A股列表（QMT 未连接？）")
+    frames = []
+    t0 = time.time()
+    batch = 500
+    for i in range(0, len(stocks), batch):
+        chunk = stocks[i:i + batch]
+        bars = xtdata.get_market_data_ex([], chunk, period="1d",
+                                         start_time=args.start, end_time=args.end,
+                                         dividend_type="front")
+        for c in chunk:
+            df = bars.get(c)
+            if df is None or df.empty:
+                continue
+            frames.append(pd.DataFrame({
+                "code": c,
+                "date": pd.to_datetime(df.index),
+                "open": df["open"].to_numpy(dtype=float),
+                "high": df["high"].to_numpy(dtype=float),
+                "low": df["low"].to_numpy(dtype=float),
+                "close": df["close"].to_numpy(dtype=float),
+                "volume": df["volume"].to_numpy(dtype=float),
+                "amount": df["amount"].to_numpy(dtype=float),
+            }))
+        done = min(i + batch, len(stocks))
+        if done % (batch * 3) == 0 or done == len(stocks):
+            print(f"  缓存构建 {done}/{len(stocks)}  已用 {time.time()-t0:.0f}s", flush=True)
+    out = pd.concat(frames, ignore_index=True)
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_pickle(out_path)
+    print(f"已保存: {out_path}  （{len(out)} 行, {out['code'].nunique()} 只, "
+          f"{str(out['date'].min())[:10]} ~ {str(out['date'].max())[:10]}，前复权）")
+
+
 def main():
     _reconfigure_stdout()
     parser = argparse.ArgumentParser(description="VCP 策略历史回测与参数校准（Phase 4）")
@@ -445,7 +569,12 @@ def main():
     p_run.add_argument("--require-stage2", action="store_true", default=True)
     p_run.add_argument("--entry", choices=["breakout", "setup"], default="breakout")
     p_run.add_argument("--max-ext", type=float, default=0.15, help="突破后最大延伸（相对中枢点），超过视为追高")
+    p_run.add_argument("--require-brv", action="store_true", default=False,
+                       help="要求突破日放量确认（需带成交量数据缓存）")
+    p_run.add_argument("--require-dry", action="store_true", default=False,
+                       help="要求量能萎缩（末段收缩量能 <= 首段 60%）")
     p_run.add_argument("--smoke", action="store_true", help="快速冒烟测试")
+    p_run.add_argument("--workers", type=int, default=1, help="检测多进程数（日度评估建议 4-8）")
     p_run.add_argument("--dump-events", default="", help="导出事件 JSON 路径")
     p_run.set_defaults(func=cmd_run)
 
@@ -456,9 +585,21 @@ def main():
     p_sweep.add_argument("--rs-min-list", type=float, nargs="+", default=[0.0, 70.0, 90.0])
     p_sweep.add_argument("--stage2", type=int, nargs="+", choices=[0, 1], default=[1])
     p_sweep.add_argument("--max-exts", type=float, nargs="+", default=[0.15])
+    p_sweep.add_argument("--brv", type=int, nargs="+", choices=[0, 1], default=[0],
+                         help="是否要求突破日放量确认（0=否 1=是）")
+    p_sweep.add_argument("--dry", type=int, nargs="+", choices=[0, 1], default=[0],
+                         help="是否要求量能萎缩（0=否 1=是）")
     p_sweep.add_argument("--out", default="", help="校准表 Markdown 输出路径")
+    p_sweep.add_argument("--workers", type=int, default=1, help="检测多进程数（日度评估建议 4-8）")
     p_sweep.add_argument("--dump-events", default="", help="缓存事件 JSON（跳过下次检测）")
     p_sweep.add_argument("--load-events", default="", help="从缓存 JSON 加载事件，跳过检测/RS")
+
+    p_cache = sub.add_parser("cache", help="从 xtquant 构建带成交量的日线缓存")
+    p_cache.add_argument("--cache", default=os.environ.get("MAGICIAN_CACHE", DEFAULT_CACHE))
+    p_cache.add_argument("--start", default="20180101")
+    p_cache.add_argument("--end", default=time.strftime("%Y%m%d"))
+    p_cache.add_argument("--out", default=r"D:\Users\projects\ai-berkshire\data\magician\live_cache.pkl")
+    p_cache.set_defaults(func=cmd_cache)
     p_sweep.set_defaults(func=cmd_sweep)
 
     args = parser.parse_args()

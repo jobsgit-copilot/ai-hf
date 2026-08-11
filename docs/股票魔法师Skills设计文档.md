@@ -3,7 +3,7 @@
 > **版本**：v0.1（设计稿）  
 > **日期**：2026-08-11  
 > **状态**：待评审（Phase 0）  
-> **实施进度**：Phase 1-3 已落地（2026-08-11）—— `tools/magician_data.py`（bars/trend/rs/stage）与 `tools/vcp_detector.py`（detect/scan）v1 已实现并验证（数据后端：ai2miniqmt xtquant 前复权日线 + 全市场日线缓存 RS 分位）；7 个 `skills/magician-*.md` 已编写，经 `scripts/sync-codex-skills.py` 同步生成 codex-skills。
+> **实施进度**：Phase 1-4 已落地（2026-08-11）—— `tools/magician_data.py`（bars/trend/rs/stage）、`tools/vcp_detector.py`（detect/scan）、`tools/magician_backtest.py`（回测+参数扫描）均已实现并验证（数据后端：ai2miniqmt xtquant 前复权日线 + 全市场日线缓存）；7 个 `skills/magician-*.md` 已编写并经 `scripts/sync-codex-skills.py` 同步；Phase 4 回测报告见 `reports/magician-vcp-backtest-20260811.md`，据此修订：收缩≥3次优先、止损7%/10%、RR计划目标≥3、RS不作一票否决、追高≤15%、新增大盘环境过滤。
 > **适用范围**：ai-berkshire 仓库新增「magician-*」skills 与配套工具  
 > **输入资料**：`docs/Magician/` 下《股票魔法师》系列四本书（已提取章节文本于本地临时目录）
 

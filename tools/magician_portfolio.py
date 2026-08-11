@@ -70,7 +70,7 @@ def _entry_filters(cfg, ev):
 
 
 def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5,
-             max_positions=6, max_weight=25.0, horizon=60, breadth_th=0.6):
+             max_positions=6, max_weight=25.0, horizon=60, breadth_th=0.6, full_invest=False):
     """事件驱动的组合模拟。返回结果字典。"""
     # 交易日历：限制在事件区间内（避免 2018-2019 空转稀释 CAGR）
     ev_dates = np.sort(np.unique(np.array([e["date"] for e in events], dtype="datetime64[ns]")))
@@ -152,16 +152,21 @@ def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5
                 continue
             stop = max(ev["pivot"] * (1 - cfg["stop_pct"] / 100.0), ev["base_low"] or ev["pivot"] * 0.9)
             entry = ev["entry"]
-            risk_dist = (entry - stop) / entry if entry > stop else 0.10
-            w = min((risk_pct / 100.0) / risk_dist, max_weight / 100.0)
-            if regime_mode:
-                coeff = 1.0 if (ev.get("idx_above_ma200") and (ev.get("breadth") or 0) >= breadth_th) else                         (0.8 if ev.get("idx_above_ma200") else 0.5)
-                w *= coeff
-            if len(positions) >= max_positions or cash < w:
+            if len(positions) >= max_positions:
                 skipped_capacity += 1
                 continue
             equity_now = cash + sum(p.shares * arrays[p.code][4][
                 int(np.searchsorted(arrays[p.code][0], day, side="right") - 1)] for p in positions)
+            if equity_now <= 0:
+                continue
+            risk_dist = (entry - stop) / entry if entry > stop else 0.10
+            if full_invest:
+                w = min(max_weight / 100.0, cash / equity_now)
+            else:
+                w = min((risk_pct / 100.0) / risk_dist, max_weight / 100.0)
+            if regime_mode:
+                coeff = 1.0 if (ev.get("idx_above_ma200") and (ev.get("breadth") or 0) >= breadth_th) else                         (0.8 if ev.get("idx_above_ma200") else 0.5)
+                w *= coeff
             cost = w * equity_now
             if cash < cost:
                 skipped_capacity += 1
@@ -196,6 +201,7 @@ def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5
     eq = pd.Series([v for _, v in equity_curve], index=[d for d, _ in equity_curve])
     res = summarize_portfolio(eq, trades, exposure_curve, skipped_capacity, skipped_lockout, cfg, funnel_level)
     res["equity"] = [[str(d)[:10], round(float(v), 4)] for d, v in zip(eq.index[::5], eq.values[::5])]
+    res["exposure"] = [[str(d)[:10], round(float(v), 4)] for d, v in zip(eq.index[::5], exposure_curve[::5])]
     return res
 
 
@@ -210,6 +216,8 @@ def summarize_portfolio(eq, trades, exposure_curve, skipped_capacity, skipped_lo
     annual = {str(y): (grp.iloc[-1] / grp.iloc[0] - 1) * 100 for y, grp in yr.groupby(yr.index.year)}
     trades_s = pd.DataFrame(trades) if trades else pd.DataFrame()
     avg_exposure = float(np.mean(exposure_curve)) * 100 if exposure_curve else 0.0
+    invested_days = sum(1 for x in exposure_curve if x > 1e-9)
+    pct_days_invested = invested_days / len(exposure_curve) * 100 if exposure_curve else 0.0
     if len(trades_s):
         outcomes = trades_s["outcome_pct"]
         win_rate = float((outcomes > 0).mean()) * 100
@@ -222,7 +230,8 @@ def summarize_portfolio(eq, trades, exposure_curve, skipped_capacity, skipped_lo
     return {"final": final, "cagr": cagr, "max_dd": max_dd, "annual": annual,
             "n_trades": len(trades), "win_rate": win_rate, "expectancy": exp,
             "avg_win": avg_win, "avg_loss": avg_loss, "hit20": hit20,
-            "avg_exposure": avg_exposure, "skipped_capacity": skipped_capacity,
+            "avg_exposure": avg_exposure, "pct_days_invested": pct_days_invested,
+            "skipped_capacity": skipped_capacity,
             "skipped_lockout": skipped_lockout, "trades": trades}
 
 
@@ -250,7 +259,8 @@ def cmd_run(args):
 
     res = simulate(events, arrays, cfg, funnel_level=args.funnel, regime_mode=args.regime,
                    risk_pct=args.risk_pct, max_positions=args.max_positions,
-                   max_weight=args.max_weight, horizon=args.horizon, breadth_th=args.breadth_th)
+                   max_weight=args.max_weight, horizon=args.horizon, breadth_th=args.breadth_th,
+                   full_invest=args.full_invest)
 
     if args.json:
         out = {k: v for k, v in res.items() if k != "trades"}
@@ -258,17 +268,21 @@ def cmd_run(args):
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return
 
-    print(f"\n=== 组合回测结果（漏斗{args.funnel}，regime={args.regime}）===")
+    mode = "满仓" if args.full_invest else "风险平价"
+    print(f"\n=== 组合回测结果（漏斗{args.funnel}，regime={args.regime}，{mode}）===")
     print(f"最终净值 {res['final']:.3f}  CAGR {res['cagr']:.1f}%  最大回撤 {res['max_dd']:.1f}%  "
           f"交易 {res['n_trades']} 笔  胜率 {res['win_rate']}%  期望 {res['expectancy']}%  "
-          f"平均暴露 {res['avg_exposure']}%  容量跳过 {res['skipped_capacity']}")
+          f"平均暴露 {res['avg_exposure']}%  现金占比 {100 - res['avg_exposure']:.1f}%  "
+          f"有持仓天数 {res['pct_days_invested']:.0f}%  容量跳过 {res['skipped_capacity']}")
     print("分年收益: " + "  ".join(f"{y}={v:.1f}%" for y, v in sorted(res["annual"].items())))
 
     if args.out:
-        lines = [f"# VCP 组合级回测（P2）：漏斗{args.funnel} 环境系数={args.regime}",
+        mode = "满仓" if args.full_invest else "风险平价"
+        lines = [f"# VCP 组合级回测（P2）：漏斗{args.funnel} 环境系数={args.regime} 仓位={mode}",
                  "",
-                 f"> 开始资金 1.0；单笔风险 {args.risk_pct}% / 止损 {args.stop_pct}% → 单笔仓位约 "
-                 f"{min(args.risk_pct/args.stop_pct*100, args.max_weight):.0f}%（上限{args.max_weight}%）；最多 {args.max_positions} 只持仓；同标的80日锁仓",
+                 f"> 开始资金 1.0；止损 {args.stop_pct:.0f}%；"
+                 f"{'满仓：新仓尽量用到单只上限' if args.full_invest else '风险平价：单笔风险 ' + str(args.risk_pct) + '% → 单笔仓位约 ' + format(min(args.risk_pct / args.stop_pct * 100, args.max_weight), '.0f') + '%'}"
+                 f"（单只上限{args.max_weight:.0f}%）；最多 {args.max_positions} 只持仓；同标的80日锁仓",
                  "",
                  "| 指标 | 值 |",
                  "|---|---|",
@@ -279,6 +293,8 @@ def cmd_run(args):
                  f"| 胜率 | {res['win_rate']}% |",
                  f"| 单笔期望 | {res['expectancy']}% |",
                  f"| 平均仓位暴露 | {res['avg_exposure']}% |",
+                 f"| 平均现金占比 | {100 - res['avg_exposure']:.1f}% |",
+                 f"| 有持仓天数占比 | {res['pct_days_invested']:.1f}% |",
                  f"| 因容量跳过 | {res['skipped_capacity']} |",
                  "",
                  "| 年份 | 收益 |",
@@ -311,6 +327,8 @@ def main():
     p.add_argument("--require-dry", action="store_true", default=True)
     p.add_argument("--require-brv", action="store_true", default=False)
     p.add_argument("--risk-pct", type=float, default=1.5)
+    p.add_argument("--full-invest", action="store_true", default=False,
+                   help="满仓模式：新仓按可用现金尽量配到单只上限，不保留现金")
     p.add_argument("--max-positions", type=int, default=6)
     p.add_argument("--max-weight", type=float, default=25.0)
     p.add_argument("--horizon", type=int, default=60)

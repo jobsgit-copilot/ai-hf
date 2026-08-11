@@ -121,6 +121,48 @@ def rs_percentiles(df, eval_dates, windows=(252, 126, 63)):
     return out
 
 
+def load_index(path):
+    """加载指数日线缓存（date/close 两列，升序）。"""
+    idx = pd.read_pickle(path)
+    idx["date"] = pd.to_datetime(idx["date"])
+    return idx.sort_values("date")
+
+
+def compute_breadth(df, dates):
+    """市场宽度：每个评估日收盘价站上自身 MA200 的股票占比（0-1）。
+
+    仅统计当日有行情的股票；个股需满 200 个交易日才有 MA200。
+    返回 {date_str: float}。
+    """
+    ma200 = df.groupby("code", sort=False)["close"].rolling(200, min_periods=200).mean()
+    ma200 = ma200.reset_index(level=0, drop=True)
+    above = (df["close"] > ma200)
+    series = above.groupby(df["date"]).mean()
+    return {str(ts)[:10]: float(v) for ts, v in series.items() if v == v}
+
+
+def tag_regime(events, index_df, breadth):
+    """给事件打大盘环境标签：沪深300 收盘 vs MA200（up/down）+ 市场宽度。
+
+    事件日期晚于指数末日的按指数末日近似（前向填充）。
+    """
+    idx_dates = index_df["date"].to_numpy()
+    idx_close = index_df["close"].to_numpy(dtype=float)
+    ma = pd.Series(idx_close).rolling(200, min_periods=200).mean().to_numpy()
+    for ev in events:
+        p = int(np.searchsorted(idx_dates, np.datetime64(ev["date"]), side="right") - 1)
+        if p < 0:
+            ev["idx_above_ma200"] = False
+            ev["regime"] = "down"
+            ev["breadth"] = None
+            continue
+        above = bool(idx_close[p] > ma[p])
+        ev["idx_above_ma200"] = above
+        ev["regime"] = "up" if above else "down"
+        ev["breadth"] = breadth.get(ev["date"])
+    return events
+
+
 # ---------------------------------------------------------------- 事件检测
 
 def _detect_chunk(payload):
@@ -547,6 +589,81 @@ def cmd_cache(args):
           f"{str(out['date'].min())[:10]} ~ {str(out['date'].max())[:10]}，前复权）")
 
 
+def cmd_regime(args):
+    """P0：按大盘环境分组评估——沪深300 站上/跌破 MA200（叠加市场宽度）。
+
+    事件来源：--events（回测 dump 的 JSON，含 rs/volume_dry/brv 字段）。
+    """
+    events = json.loads(Path(args.events).read_text(encoding="utf-8"))
+    df = load_cache(args.cache)
+    arrays = build_arrays(df)
+    index_df = load_index(args.index)
+    breadth = compute_breadth(df, [e["date"] for e in events])
+    tag_regime(events, index_df, breadth)
+
+    n_up = sum(1 for e in events if e["regime"] == "up")
+    n_down = len(events) - n_up
+    dates_up = {e["date"] for e in events if e["regime"] == "up"}
+    dates_down = {e["date"] for e in events if e["regime"] == "down"}
+    n_wide = sum(1 for e in events if e["regime"] == "up" and (e["breadth"] or 0) >= args.breadth_th)
+    print(f"事件 {len(events)}：up={n_up} ({len(dates_up)} 个评估日) / down={n_down} ({len(dates_down)} 个评估日) / "
+          f"up且宽度≥{args.breadth_th:.0%}={n_wide}")
+
+    configs = []
+    for stop_pct in args.stops:
+        for rr in args.rrs:
+            for mc in args.mcs:
+                for rs_min in args.rs_min_list:
+                    for brv in args.brv:
+                        for dry in args.dry:
+                            configs.append({"stop_pct": stop_pct, "rr": rr, "min_contractions": mc,
+                                            "rs_min": rs_min, "require_stage2": True,
+                                            "entry": "breakout", "max_ext": 0.15,
+                                            "require_brv": bool(brv), "require_dry": bool(dry)})
+
+    groups = {
+        "all": events,
+        "up": [e for e in events if e["regime"] == "up"],
+        "down": [e for e in events if e["regime"] == "down"],
+        "up_wide": [e for e in events if e["regime"] == "up" and (e["breadth"] or 0) >= args.breadth_th],
+    }
+    rows = []
+    for cfg in configs:
+        label = _config_label(cfg)
+        for gname, evs in groups.items():
+            trades, s = measure(evs, arrays, cfg, horizon=args.horizon)
+            rows.append({"group": gname, "config": label, "n": s["n"], "win_rate": s["win_rate"],
+                         "avg_win": s["avg_win"], "avg_loss": s["avg_loss"],
+                         "expectancy_pct": s["expectancy_pct"], "median_outcome": s["median_outcome"],
+                         "hit20_rate": s["hit20_rate"]})
+
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return
+
+    print(f"\n=== 分环境结果（按期望降序）===")
+    print(f"{'环境':<10}{'配置':<38}{'笔数':>6}{'胜率%':>7}{'均盈%':>7}{'均亏%':>7}{'期望%':>8}{'中位%':>8}{'先+20%':>7}")
+    for r in sorted(rows, key=lambda x: -(x["expectancy_pct"] or -999)):
+        print(f"{r['group']:<10}{r['config']:<38}{r['n']:>6}{str(r['win_rate']):>7}{str(r['avg_win']):>7}"
+              f"{str(r['avg_loss']):>7}{r['expectancy_pct']:>8.2f}{str(r['median_outcome']):>8}{str(r['hit20_rate']):>7}")
+
+    if args.out:
+        out_path = Path(args.out)
+        rep = [f"# VCP 策略大盘环境分组回测（P0，{args.start_hint}）",
+               "",
+               f"> 事件：{len(events)} 个（up={n_up} / down={n_down}）；up且宽度≥{args.breadth_th:.0%}={n_wide}",
+               f"> 规则：沪深300 收盘 vs MA200 定 up/down；市场宽度 = 全市场站上 MA200 的股票占比",
+               f"> 口径：与日度复核一致（收盘价成交、T+1、止损=中枢点下方7%/更近基底低点、同标的80日锁仓）",
+               "",
+               "| 环境 | 配置 | 笔数 | 胜率% | 均盈% | 均亏% | 期望% | 中位% | 先达+20% |",
+               "|---|---|---|---|---|---|---|---|---|---|"]
+        for r in sorted(rows, key=lambda x: -(x["expectancy_pct"] or -999)):
+            rep.append(f"| {r['group']} | {r['config']} | {r['n']} | {r['win_rate']} | {r['avg_win']} | "
+                       f"{r['avg_loss']} | {r['expectancy_pct']} | {r['median_outcome']} | {r['hit20_rate']} |")
+        out_path.write_text("\n".join(rep), encoding="utf-8")
+        print(f"报告已保存: {out_path}")
+
+
 def main():
     _reconfigure_stdout()
     parser = argparse.ArgumentParser(description="VCP 策略历史回测与参数校准（Phase 4）")
@@ -600,6 +717,24 @@ def main():
     p_cache.add_argument("--end", default=time.strftime("%Y%m%d"))
     p_cache.add_argument("--out", default=r"D:\Users\projects\ai-berkshire\data\magician\live_cache.pkl")
     p_cache.set_defaults(func=cmd_cache)
+
+    p_regime = sub.add_parser("regime", help="P0：按大盘环境（沪深300 vs MA200 + 市场宽度）分组评估")
+    p_regime.add_argument("--events", required=True, help="回测 dump 的事件 JSON（--dump-events）")
+    p_regime.add_argument("--cache", default=os.environ.get("MAGICIAN_CACHE", DEFAULT_CACHE))
+    p_regime.add_argument("--index", required=True, help="指数日线 pickle（date/close 两列）")
+    p_regime.add_argument("--breadth-th", type=float, default=0.60, help="up_wide 的宽度阈值")
+    p_regime.add_argument("--stops", type=float, nargs="+", default=[7.0])
+    p_regime.add_argument("--rrs", type=float, nargs="+", default=[3.0])
+    p_regime.add_argument("--mcs", type=int, nargs="+", default=[2, 3])
+    p_regime.add_argument("--rs-min-list", type=float, nargs="+", default=[0.0])
+    p_regime.add_argument("--brv", type=int, nargs="+", choices=[0, 1], default=[0])
+    p_regime.add_argument("--dry", type=int, nargs="+", choices=[0, 1], default=[0, 1])
+    p_regime.add_argument("--horizon", type=int, default=60)
+    p_regime.add_argument("--json", action="store_true")
+    p_regime.add_argument("--out", default="", help="分组报告 Markdown 输出路径")
+    p_regime.add_argument("--start-hint", default="2020-01~2026-08，日度评估", help="报告标题日期说明")
+    p_regime.set_defaults(func=cmd_regime)
+
     p_sweep.set_defaults(func=cmd_sweep)
 
     args = parser.parse_args()

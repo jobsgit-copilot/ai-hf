@@ -3,7 +3,7 @@
 > **版本**：v0.1（设计稿）  
 > **日期**：2026-08-11  
 > **状态**：待评审（Phase 0）  
-> **实施进度**：Phase 1-4 已落地（2026-08-11）—— `tools/magician_data.py`（bars/trend/rs/stage）、`tools/vcp_detector.py`（detect/scan）、`tools/magician_backtest.py`（回测+参数扫描）均已实现并验证（数据后端：ai2miniqmt xtquant 前复权日线 + 全市场日线缓存）；7 个 `skills/magician-*.md` 已编写并经 `scripts/sync-codex-skills.py` 同步；Phase 4 回测报告见 `reports/magician-vcp-backtest-20260811.md`，据此修订：收缩≥3次优先、止损7%/10%、RR计划目标≥3、RS不作一票否决、追高≤15%、新增大盘环境过滤。Phase 4 复核（2026-08-11）：评估日加密到日度（1601 个交易日）并用带成交量实时数据复核，报告见 `reports/magician-vcp-backtest-daily-20260811.md` 与 `reports/magician-vcp-calibration-daily-20260811.md`；结论：日度评估笔数×4、期望改善；**量能萎缩（末段≤首段60%）为核心增强条件（期望+0.9~1.7pp）**；突破放量确认不单独过滤；RS≥90 在带量萎缩过滤下转正（样本小）；2023-2026 期望不再归零。
+> **实施进度**：Phase 1-4 已落地（2026-08-11）—— `tools/magician_data.py`（bars/trend/rs/stage）、`tools/vcp_detector.py`（detect/scan）、`tools/magician_backtest.py`（回测+参数扫描）均已实现并验证（数据后端：ai2miniqmt xtquant 前复权日线 + 全市场日线缓存）；7 个 `skills/magician-*.md` 已编写并经 `scripts/sync-codex-skills.py` 同步；Phase 4 回测报告见 `reports/magician-vcp-backtest-20260811.md`，据此修订：收缩≥3次优先、止损7%/10%、RR计划目标≥3、RS不作一票否决、追高≤15%、新增大盘环境过滤。Phase 4 复核（2026-08-11）：评估日加密到日度（1601 个交易日）并用带成交量实时数据复核，报告见 `reports/magician-vcp-backtest-daily-20260811.md` 与 `reports/magician-vcp-calibration-daily-20260811.md`；结论：日度评估笔数×4、期望改善；**量能萎缩（末段≤首段60%）为核心增强条件（期望+0.9~1.7pp）**；突破放量确认不单独过滤；RS≥90 在带量萎缩过滤下转正（样本小）；2023-2026 期望不再归零。P0 大盘环境分组回测（2026-08-11，`reports/magician-vcp-regime-20260811.md`）：指数 MA200 对裸 VCP 有弱区分力（up +1.91% vs down +0.72%），对量能萎缩强信号无增量（down 段期望 ≥ up 段，样本小）；最强组合 up_wide+dy+RS≥90 期望 +10.9%（n=38）。结论：大盘环境从硬开关改为**仓位系数**（up_wide×1.0 / up×0.8 / down×0.5），只保留 down 段最强信号。
 > **适用范围**：ai-berkshire 仓库新增「magician-*」skills 与配套工具  
 > **输入资料**：`docs/Magician/` 下《股票魔法师》系列四本书（已提取章节文本于本地临时目录）
 
@@ -358,6 +358,7 @@ flowchart LR
 - **突破放量确认（单日 ≥1.5×20 日均量）不单独过滤**：期望几乎不变、笔数 -30%，A 股常见缩量突破/次日放量；改为突破后 2-3 日累计放量跟进确认。
 - **RS≥90 复核转正**：带量萎缩过滤后 rs90 配置期望 +4.75%（n=113，2023-2026 +7.33%），推翻月度"RS≥90 全负"结论（样本小，需谨慎）——高 RS + 缩量回调 + 放量突破是强势股特征。
 - **2023-2026 不再归零**：日度 + 量能过滤下后期期望 +1.6%~+2.2%（月度约为 0）。
+- **P0 大盘环境分组（2026-08-11）**：指数 MA200 只对裸 VCP 有弱区分力（up +1.91% vs down +0.72%），对量能萎缩强信号无增量（down 段期望 ≥ up 段，样本小）；up_wide+dy+RS≥90 期望 +10.9%（n=38）。→ 环境改作**仓位系数**（up_wide×1.0/up×0.8/down×0.5），不做硬开关。
 
 报告：`reports/magician-vcp-backtest-daily-20260811.md`、`reports/magician-vcp-calibration-daily-20260811.md`。
 

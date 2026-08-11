@@ -1,0 +1,102 @@
+---
+name: magician-trade-journal
+description: "AI Berkshire skill: 交易日志与复盘：期望值统计 + 纪律审计. Source: skills/magician-trade-journal.md."
+---
+
+## Codex adapter note
+
+This skill is generated from `skills/magician-trade-journal.md` so Claude Code and Codex users share one canonical workflow.
+
+- Treat `$ARGUMENTS` as the user's request in the current Codex thread.
+- When the source mentions Claude-only surfaces such as Task, Agent, WebSearch, Bash, Read, or Write, use the closest Codex capability available in this session: subagents when available, web search when needed, shell commands for local tools, and normal file edits for workspace files.
+- Use shared project tools from `tools/` in this repository. Prefer running commands from the repository root with paths like `python3 tools/financial_rigor.py ...`; if the current thread starts outside the repo, locate the actual checkout path first instead of assuming a fixed home-directory path.
+- Before starting research, run the `date` command to confirm today's date; treat it as the baseline for "latest" data and state the data cutoff date in the report header. Never assume the current date from training data.
+- Preserve the research quality rules from `AGENTS.md`: cross-check financial data, use exact arithmetic tools for valuation/math, and clearly label uncertainty and source gaps.
+
+# 交易日志与复盘：期望值统计 + 纪律审计
+
+对 $ARGUMENTS 记录/分析交易，输出复盘报告与参数校准建议（RBA）。本 skill 是 SEPA 体系的收尾环节，让方法论"用结果说话"。
+
+## 适用场景
+
+- 完成一笔买入/卖出后登记交易记录
+- 每周/每月复盘：胜率、期望值、纪律执行情况
+- "我最近的交易问题出在哪？"
+
+方法论来源：《像冠军一样思考和交易》第 1/4 章（交易真相、RBA）。
+
+---
+
+## 第一步：登记交易记录
+
+每笔交易至少包含：
+
+| 字段 | 说明 |
+|------|------|
+| 日期 | 买入/卖出日期 |
+| 标的 | 代码 |
+| 方向 | 买入 / 卖出（平仓） |
+| 买价 / 卖价 | 成交均价 |
+| 股数 / 金额 | 仓位 |
+| 止损价 | 计划止损 |
+| 结果 | 盈利 % / 亏损 % / R 倍数 |
+| 守纪律 | 是/否 + 破例说明 |
+| 备注 | 信号、足迹、板块 |
+
+建议登记在 `data/magician/trades.json` 或等同结构，字段齐全才可统计。
+
+## 第二步：周期统计
+
+| 指标 | 口径 |
+|------|------|
+| 胜率 | 盈利笔数 ÷ 总笔数 |
+| 平均盈利 / 平均亏损 | 按百分比或 R 倍数 |
+| 期望值 E | 胜率 × 平均盈利 − 败率 × 平均亏损（必须为正） |
+| R 倍数分布 | 单笔盈亏 ÷ 计划风险 |
+| 最大回撤 | 账户净值从高点回落幅度 |
+| 破例次数 | 未守纪律的交易笔数 |
+
+输出：统计表 + 一句话结论（如"胜率 55%、E=0.6R、主要亏损来自破例止损"）。
+
+## 第三步：纪律审计清单
+
+逐项检查近期交易：
+
+- [ ] 是否全部按计划止损（没有"再等等"）
+- [ ] 是否摊低成本（永不摊低）
+- [ ] 是否出现过"就这一次"破例
+- [ ] 是否追高买入（无 VCP 也买）
+- [ ] 是否按计划仓位执行（没有盘中临时加码）
+- [ ] 情绪驱动决策（报复性交易/怕错过）是否发生
+
+破例项必须给出原因与下次预防动作。
+
+## 第四步：RBA 参数校准（结果导向设参）
+
+用统计结果调整交易参数，而不是凭感觉：
+
+| 观察 | 调整方向 |
+|------|---------|
+| 胜率低但盈亏比高（E 为正） | 保持，可略收紧买点 |
+| 平均亏损 > 6% | 收紧止损宽度或选更紧的 VCP 足迹 |
+| E 为负 | 降单笔风险、提高 RS/模板门槛，暂停加仓 |
+| 破例亏损占比高 | 纪律问题优先，参数其次 |
+
+输出校准建议：单笔风险%、止损宽度、RS 门槛、足迹筛选标准。
+
+## 输出复盘报告
+
+```text
+# 交易复盘（周期：____）
+胜率：__%   平均盈利：__%   平均亏损：__%   期望值：__R   最大回撤：__%
+纪律执行：__/__ 笔守纪律；破例 __ 笔（原因：____）
+问题诊断：____
+参数校准：单笔风险 __% / 止损宽度 __% / RS 门槛 __ / 足迹要求 ____
+```
+
+复盘报告落盘 `reports/`，作为后续交易与 `magician-sepa` 阈值修订的依据。
+
+## 纪律要求
+
+- 记录优先于解释：先登记数据，再写感想。
+- 统计基于完整周期（至少 10-20 笔），不因单笔结果改变规则。

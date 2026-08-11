@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """magician_data.py — 股票魔法师数据工具：日线 / 趋势模板8条 / 相对强度 / 四阶段。
 
 方法论来源：docs/Magician/《股票魔法师》系列

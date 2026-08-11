@@ -3,7 +3,7 @@
 > **版本**：v0.1（设计稿）  
 > **日期**：2026-08-11  
 > **状态**：待评审（Phase 0）  
-> **实施进度**：Phase 1 已启动 —— `tools/magician_data.py`（bars/trend/rs/stage）v1 已实现，数据后端为 ai2miniqmt xtquant（前复权日线）+ 全市场日线缓存（RS 分位），2026-08-11
+> **实施进度**：Phase 1-3 已落地（2026-08-11）—— `tools/magician_data.py`（bars/trend/rs/stage）与 `tools/vcp_detector.py`（detect/scan）v1 已实现并验证（数据后端：ai2miniqmt xtquant 前复权日线 + 全市场日线缓存 RS 分位）；7 个 `skills/magician-*.md` 已编写，经 `scripts/sync-codex-skills.py` 同步生成 codex-skills。
 > **适用范围**：ai-berkshire 仓库新增「magician-*」skills 与配套工具  
 > **输入资料**：`docs/Magician/` 下《股票魔法师》系列四本书（已提取章节文本于本地临时目录）
 

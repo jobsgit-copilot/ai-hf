@@ -1,0 +1,93 @@
+---
+name: magician-growth-fundamental
+description: "AI Berkshire skill: 成长基本面确认：净利润加速 + 催化剂 + 领头羊. Source: skills/magician-growth-fundamental.md."
+---
+
+## Codex adapter note
+
+This skill is generated from `skills/magician-growth-fundamental.md` so Claude Code and Codex users share one canonical workflow.
+
+- Treat `$ARGUMENTS` as the user's request in the current Codex thread.
+- When the source mentions Claude-only surfaces such as Task, Agent, WebSearch, Bash, Read, or Write, use the closest Codex capability available in this session: subagents when available, web search when needed, shell commands for local tools, and normal file edits for workspace files.
+- Use shared project tools from `tools/` in this repository. Prefer running commands from the repository root with paths like `python3 tools/financial_rigor.py ...`; if the current thread starts outside the repo, locate the actual checkout path first instead of assuming a fixed home-directory path.
+- Before starting research, run the `date` command to confirm today's date; treat it as the baseline for "latest" data and state the data cutoff date in the report header. Never assume the current date from training data.
+- Preserve the research quality rules from `AGENTS.md`: cross-check financial data, use exact arithmetic tools for valuation/math, and clearly label uncertainty and source gaps.
+
+# 成长基本面确认：净利润加速 + 催化剂 + 领头羊
+
+对 $ARGUMENTS 从成长股角度确认基本面，输出"通过 / 存疑 / 否决"三档结论。本 skill 是 SEPA 漏斗的第二层，只判成长性与催化剂，不做完整价值评估。
+
+## 适用场景
+
+- 趋势候选池（`magician-trend-screen` 输出）的基本面确认
+- "这只股票成长性如何？是否符合魔法师的成长股标准？"
+
+与 `quality-screen`（价值质量 7 条）的分工：
+- `quality-screen` 排"非一流公司"（护城河、现金流、盈利质量）
+- 本 skill 判"成长加速与催化剂"（净利润/营收加速、EPS 惊喜、分析师上调、领头羊）
+- 两者可先后使用：先排雷（quality-screen），再判成长（本 skill）
+
+---
+
+## 第一步：拉取财务数据
+
+```bash
+python3 tools/ashare_data.py financials 600519    # 近 5 年核心财务（腾讯/东财）
+python3 tools/ashare_data.py valuation 600519     # 估值与市值
+```
+
+数据以已披露财报为准（A 股披露滞后：一季报 4 月底前、中报 8 月底前、三季报 10 月底前、年报次年 4 月底前），**禁止使用未披露的未来数据**。
+
+## 第二步：检查项与标准
+
+### 1. 净利润与营收加速（核心）
+
+| 信号 | 通过标准 | 说明 |
+|------|---------|------|
+| 净利润同比增速 | 最新季度 ≥ 25%（成长股口径） | 至少近 2 个季度 |
+| 净利润环比加速 | 增速逐季抬升 | 允许季节性修正 |
+| 营收增速 | 同步改善（≥ 15%） | 净利润高增但营收停滞需警惕 |
+
+### 2. EPS 惊喜
+
+- 最新财报 EPS 高于一致预期 → 加分（A 股一致预期数据有限，可用"实际 vs 此前券商预测"近似）
+- 连续 2 期超预期 → 强信号
+
+### 3. 分析师上调（可选佐证）
+
+- A 股免费数据源缺少完整一致预期，此信号**降级为佐证**：检索近期研报标题/评级上调新闻，不阻塞流程。
+
+### 4. 领头羊地位
+
+- 板块内创新高者优先：RS 排名板块前列（`magician_data.py rs`），或近 3 个月涨幅板块前 10%。
+- "要成为赢家必须创新高"——只关注率先创新高的标的。
+
+### 5. 质量红线（一票否决）
+
+- 财报被出具非标意见 / 审计异常
+- ST、*ST、退市风险警示
+- 商誉暴雷 / 现金流与利润严重背离（交叉验证用 `financial_rigor.py`）
+
+## 第三步：三档结论
+
+| 结论 | 条件 | 后续 |
+|------|------|------|
+| 通过 | 净利润与营收均改善（或净利高增且营收向好），无红线 | 进入 VCP 买点层 |
+| 存疑 | 一项指标走弱但可解释（季节性/一次性损益） | 人工复核后决定 |
+| 否决 | 连续 2 季度净利下滑、营收停滞且毛利恶化、任一红线 | 排除 |
+
+输出每只标的的结论与依据（引用具体季度数据），不允许只给结论不给证据。
+
+## 输出
+
+```text
+标的：______
+结论：通过 [ ] / 存疑 [ ] / 否决 [ ]
+依据：
+  - 净利润：最新季度 ____（同比 __%），前一季度 ____（同比 __%）
+  - 营收：最新 ____（同比 __%）
+  - EPS 惊喜：是/否/未知
+  - 分析师上调：是/否/未检索到
+  - 领头羊：板块 RS 排名 ____ / 是否创新高 ____
+  - 红线检查：无 [ ] / 命中 ______
+```

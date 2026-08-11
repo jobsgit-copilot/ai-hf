@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """magician_data.py 回归测试（纯计算逻辑，不依赖网络/xtquant）。
 
 运行： python tests/test_magician_data.py

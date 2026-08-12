@@ -36,7 +36,7 @@ def _reconfigure_stdout():
 
 class Position:
     __slots__ = ("code", "entry_date", "entry_price", "stop", "target", "shares", "weight",
-                 "entry_i", "hit20", "exit_day")
+                 "entry_i", "hit20", "exit_day", "protected", "peak_high", "armed80")
 
     def __init__(self, code, entry_date, entry_price, stop, target, shares, weight, entry_i):
         self.code = code
@@ -49,6 +49,9 @@ class Position:
         self.entry_i = entry_i
         self.hit20 = False
         self.exit_day = None
+        self.protected = False
+        self.peak_high = entry_price
+        self.armed80 = False
 
 
 def _entry_filters(cfg, ev):
@@ -72,7 +75,8 @@ def _entry_filters(cfg, ev):
 def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5,
              max_positions=6, max_weight=25.0, horizon=60, breadth_th=0.6, full_invest=False,
              lockout=LOCKOUT, mc2_half=False, nody_half=False, regime_down=0.5,
-             friction=0.0, rs_priority=False, windows=None):
+             friction=0.0, rs_priority=False, windows=None,
+             protect_be=None, trail80=False, no_target=False):
     """事件驱动的组合模拟。返回结果字典。"""
     f_side = friction / 2.0
     # 交易日历：限制在事件区间内（避免 2018-2019 空转稀释 CAGR）
@@ -125,11 +129,24 @@ def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5
             o, h, l, c = arr[1][i], arr[2][i], arr[3][i], arr[4][i]
             if h >= p.entry_price * 1.2:
                 p.hit20 = True
+            if protect_be is not None and h >= p.entry_price * (1 + protect_be):
+                p.protected = True
+            if h > p.peak_high:
+                p.peak_high = h
+                if trail80 and p.peak_high >= p.entry_price * 1.5:
+                    p.armed80 = True
             p.exit_day = i - p.entry_i
-            if l <= p.stop:
-                exit_price = p.stop
-                reason = "stop"
-            elif h >= p.target:
+            # 保护止损上移：原止损 → 保本 → 50/80 回吐线（取最高已触发水平）
+            eff_stop, stop_reason = p.stop, "stop"
+            if p.protected and p.entry_price > eff_stop:
+                eff_stop, stop_reason = p.entry_price, "protect"
+            if p.armed80:
+                trail = p.entry_price * (1 + 0.2 * (p.peak_high / p.entry_price - 1))
+                if trail > eff_stop:
+                    eff_stop, stop_reason = trail, "trail80"
+            if l <= eff_stop:
+                exit_price, reason = eff_stop, stop_reason
+            elif (not no_target) and h >= p.target:
                 exit_price = p.target
                 reason = "target"
             elif i - p.entry_i >= horizon:
@@ -298,7 +315,8 @@ def cmd_run(args):
                    max_weight=args.max_weight, horizon=args.horizon, breadth_th=args.breadth_th,
                    full_invest=args.full_invest, lockout=args.lockout,
                    mc2_half=args.mc2_half, nody_half=args.nody_half, regime_down=args.regime_down,
-                   friction=args.friction, rs_priority=args.rs_priority, windows=windows)
+                   friction=args.friction, rs_priority=args.rs_priority, windows=windows,
+                   protect_be=args.protect_be, trail80=args.trail80, no_target=args.no_target)
 
     if args.json:
         out = {k: v for k, v in res.items() if k != "trades"}
@@ -385,6 +403,12 @@ def main():
                    help="同日多信号按 RS 降序优先入场（领头羊优先）")
     p.add_argument("--window-stats", default="",
                    help="净值分段统计：逗号分隔起止、分号分隔多段，如 2020-01-01,2023-12-31;2024-01-01,2026-08-12")
+    p.add_argument("--protect-be", type=float, default=None,
+                   help="保本法则：盘中高点 ≥ 成本×(1+X) 后止损上移成本价（默认关闭；0.0=一旦盈利即保本）")
+    p.add_argument("--trail80", action="store_true", default=False,
+                   help="50/80 法则：峰值盈利≥50% 后，回吐超峰值盈利80% 时离场（保留20%）")
+    p.add_argument("--no-target", action="store_true", default=False,
+                   help="关闭固定目标价（配合 --trail80 让利润奔跑）")
     p.add_argument("--start", default="", help="事件起始日期（YYYY-MM-DD，含）")
     p.add_argument("--end", default="", help="事件截止日期（YYYY-MM-DD，含）")
     p.add_argument("--rule-debt-max", type=float, default=None, help="质量红线：资产负债率上限%")

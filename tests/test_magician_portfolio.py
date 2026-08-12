@@ -173,6 +173,48 @@ class TestSimulate(unittest.TestCase):
         self.assertEqual(res_pri["trades"][0]["code"], "BBB.SH")  # RS 高的领头羊先进
         self.assertEqual(res_def["trades"][0]["code"], "AAA.SH")  # 默认按代码序
 
+    def test_protect_be_breakeven_exit(self):
+        arrays = make_arrays()
+        dates, o, h, l, c, vol, amt = arrays["TEST.SH"]
+        i = int(np.searchsorted(dates, np.datetime64("2026-01-05")))
+        c[i] = 100.0
+        for k in range(i + 1, min(i + 4, len(dates))):  # 先涨 3 日到 ~106
+            c[k] = c[k - 1] * 1.02
+            h[k] = c[k] * 1.005
+            l[k] = c[k] * 0.995
+            o[k] = c[k - 1]
+        for k in range(i + 4, len(dates)):  # 再跌 3%/日
+            c[k] = c[k - 1] * 0.97
+            h[k] = c[k] * 1.001
+            l[k] = c[k] * 0.99
+            o[k] = c[k - 1]
+        res = MP.simulate([base_event(), dummy_event()], arrays, CFG, funnel_level="F1", protect_be=0.0)
+        self.assertEqual(res["n_trades"], 1)
+        self.assertEqual(res["trades"][0]["reason"], "protect")  # 触及盈利后回落，保本离场
+        self.assertAlmostEqual(res["trades"][0]["outcome_pct"], 0.0, delta=0.5)
+
+    def test_trail80_protects_peak_profit(self):
+        arrays = make_arrays()
+        dates, o, h, l, c, vol, amt = arrays["TEST.SH"]
+        i = int(np.searchsorted(dates, np.datetime64("2026-01-05")))
+        c[i] = 100.0
+        for k in range(i + 1, min(i + 12, len(dates))):  # 涨 5%/日 12 日，峰值盈利 ~80%
+            c[k] = c[k - 1] * 1.05
+            h[k] = c[k] * 1.005
+            l[k] = c[k] * 0.995
+            o[k] = c[k - 1]
+        for k in range(i + 12, len(dates)):  # 再跌 3%/日
+            c[k] = c[k - 1] * 0.97
+            h[k] = c[k] * 1.001
+            l[k] = c[k] * 0.99
+            o[k] = c[k - 1]
+        res = MP.simulate([base_event(), dummy_event()], arrays, CFG, funnel_level="F1",
+                          trail80=True, no_target=True)
+        self.assertEqual(res["n_trades"], 1)
+        self.assertEqual(res["trades"][0]["reason"], "trail80")
+        self.assertGreater(res["trades"][0]["outcome_pct"], 10.0)  # 保留 ~20% 峰值利润
+        self.assertLess(res["trades"][0]["outcome_pct"], 25.0)
+
 
 class TestSummarizePortfolio(unittest.TestCase):
     def test_empty(self):

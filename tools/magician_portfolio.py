@@ -71,7 +71,7 @@ def _entry_filters(cfg, ev):
 
 def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5,
              max_positions=6, max_weight=25.0, horizon=60, breadth_th=0.6, full_invest=False,
-             lockout=LOCKOUT, mc2_half=False, nody_half=False):
+             lockout=LOCKOUT, mc2_half=False, nody_half=False, regime_down=0.5):
     """事件驱动的组合模拟。返回结果字典。"""
     # 交易日历：限制在事件区间内（避免 2018-2019 空转稀释 CAGR）
     ev_dates = np.sort(np.unique(np.array([e["date"] for e in events], dtype="datetime64[ns]")))
@@ -166,7 +166,7 @@ def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5
             else:
                 w = min((risk_pct / 100.0) / risk_dist, max_weight / 100.0)
             if regime_mode:
-                coeff = 1.0 if (ev.get("idx_above_ma200") and (ev.get("breadth") or 0) >= breadth_th) else                         (0.8 if ev.get("idx_above_ma200") else 0.5)
+                coeff = 1.0 if (ev.get("idx_above_ma200") and (ev.get("breadth") or 0) >= breadth_th) else                         (0.8 if ev.get("idx_above_ma200") else regime_down)
                 w *= coeff
             if mc2_half and ev.get("n_contractions", 0) < 3:
                 w *= 0.5
@@ -242,14 +242,25 @@ def summarize_portfolio(eq, trades, exposure_curve, skipped_capacity, skipped_lo
 
 def cmd_run(args):
     events = json.loads(Path(args.events).read_text(encoding="utf-8"))
+    if args.start:
+        events = [e for e in events if e["date"] >= args.start]
+    if args.end:
+        events = [e for e in events if e["date"] <= args.end]
+    print(f"事件窗口 {args.start or '最早'} ~ {args.end or '最晚'}：{len(events)} 个", flush=True)
     df = MB.load_cache(args.cache)
     arrays = MB.build_arrays(df)
 
     t0 = time.time()
     db = MF.FundamentalDB(args.indicator, args.income, args.basic,
                           args.pb if Path(args.pb).exists() else None)
+    limits = {}
+    for a, k in [("rule_debt_max", "debt_max"), ("rule_ocf_min", "ocf_min"),
+                 ("rule_gpm_min", "gpm_min"), ("rule_roe_min", "roe_min")]:
+        v = getattr(args, a, None)
+        if v is not None:
+            limits[k] = v
     for ev in events:
-        ev["funnel"] = MF.funnel_level(MF.apply_rules(db.snapshot(ev["code"], ev["date"])))
+        ev["funnel"] = MF.funnel_level(MF.apply_rules(db.snapshot(ev["code"], ev["date"]), limits))
     print(f"漏斗标签完成：{time.time()-t0:.0f}s")
 
     index_df = None
@@ -259,14 +270,14 @@ def cmd_run(args):
         MB.tag_regime(events, index_df, breadth)
 
     cfg = {"stop_pct": args.stop_pct, "rr": args.rr, "min_contractions": args.min_contractions,
-           "rs_min": args.rs_min, "require_stage2": True, "entry": "breakout", "max_ext": 0.15,
+           "rs_min": args.rs_min, "require_stage2": True, "entry": "breakout", "max_ext": args.max_ext,
            "require_brv": args.require_brv, "require_dry": not (args.dy_off or args.nody_half)}
 
     res = simulate(events, arrays, cfg, funnel_level=args.funnel, regime_mode=args.regime,
                    risk_pct=args.risk_pct, max_positions=args.max_positions,
                    max_weight=args.max_weight, horizon=args.horizon, breadth_th=args.breadth_th,
                    full_invest=args.full_invest, lockout=args.lockout,
-                   mc2_half=args.mc2_half, nody_half=args.nody_half)
+                   mc2_half=args.mc2_half, nody_half=args.nody_half, regime_down=args.regime_down)
 
     if args.json:
         out = {k: v for k, v in res.items() if k != "trades"}
@@ -341,6 +352,14 @@ def main():
                    help="混仓：n_contractions==2 的事件仓位减半（配合 --min-contractions 2）")
     p.add_argument("--nody-half", action="store_true", default=False,
                    help="量能分级：无量能萎缩事件仓位减半（同时关闭 dy 硬过滤）")
+    p.add_argument("--max-ext", type=float, default=0.15, help="突破追高上限（entry/pivot-1 上限）")
+    p.add_argument("--regime-down", type=float, default=0.5, help="弱市环境仓位系数")
+    p.add_argument("--start", default="", help="事件起始日期（YYYY-MM-DD，含）")
+    p.add_argument("--end", default="", help="事件截止日期（YYYY-MM-DD，含）")
+    p.add_argument("--rule-debt-max", type=float, default=None, help="质量红线：资产负债率上限%")
+    p.add_argument("--rule-ocf-min", type=float, default=None, help="质量红线：经营现金流/净利润下限")
+    p.add_argument("--rule-gpm-min", type=float, default=None, help="质量红线：毛利率下限%")
+    p.add_argument("--rule-roe-min", type=float, default=None, help="质量红线：ROE 下限%")
     p.add_argument("--max-positions", type=int, default=6)
     p.add_argument("--max-weight", type=float, default=25.0)
     p.add_argument("--horizon", type=int, default=60)

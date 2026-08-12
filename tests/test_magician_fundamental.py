@@ -41,6 +41,15 @@ class TestRules(unittest.TestCase):
         self.assertEqual(MF.apply_rules(snap(gpm_avg=10.0))["r_gpm"], "fail")
         self.assertEqual(MF.apply_rules(snap(roe_annual_avg=5.0))["r_roe"], "fail")
 
+    def test_rule_limits_override(self):
+        # 阈值滑动：负债率上限 85→90 放行 88
+        r = MF.apply_rules(snap(dta_latest=88.0), limits={"debt_max": 90.0})
+        self.assertEqual(r["r_debt"], "pass")
+        self.assertEqual(MF.apply_rules(snap(dta_latest=88.0))["r_debt"], "fail")
+        # ROE 下限 8→6 放行 7
+        r2 = MF.apply_rules(snap(roe_annual_avg=7.0), limits={"roe_min": 6.0})
+        self.assertEqual(r2["r_roe"], "pass")
+
     def test_missing_data_treated_as_pass_for_quality(self):
         r = MF.apply_rules(snap(dta_latest=None, ocf_med=None, gpm_avg=None, roe_annual_avg=None))
         for k in ("r_debt", "r_ocf", "r_gpm", "r_roe"):

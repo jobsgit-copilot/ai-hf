@@ -170,24 +170,32 @@ class FundamentalDB:
         return None
 
 
-def apply_rules(snap):
-    """返回各规则判定：pass/fail/na。质量红线 na=放行；成长条件 na=不通过。"""
+def apply_rules(snap, limits=None):
+    """返回各规则判定：pass/fail/na。质量红线 na=放行；成长条件 na=不通过。
+
+    limits 可选覆盖阈值：{"debt_max": 90.0, "ocf_min": 0.5, "gpm_min": 10.0,
+    "roe_min": 6.0, "rev_yoy_min": 15.0, "pb_pct_max": 90.0}（用于第二梯队阈值扫描）。
+    """
+    L = {"debt_max": RULE_DEBT_MAX, "ocf_min": RULE_OCF_MIN, "gpm_min": RULE_GPM_MIN,
+         "roe_min": RULE_ROE_MIN, "rev_yoy_min": RULE_REV_YOY_MIN, "pb_pct_max": RULE_PB_PCT_MAX}
+    if limits:
+        L.update(limits)
     rules = {}
     rules["r_st"] = "pass" if not (snap["is_st"] or snap["delisted"]) else "fail"
     d = snap["dta_latest"]
-    rules["r_debt"] = "pass" if d is None or d <= RULE_DEBT_MAX else "fail"
+    rules["r_debt"] = "pass" if d is None or d <= L["debt_max"] else "fail"
     o = snap["ocf_med"]
-    rules["r_ocf"] = "pass" if o is None or o >= RULE_OCF_MIN else "fail"
+    rules["r_ocf"] = "pass" if o is None or o >= L["ocf_min"] else "fail"
     m = snap["gpm_avg"]
-    rules["r_gpm"] = "pass" if m is None or m >= RULE_GPM_MIN else "fail"
+    rules["r_gpm"] = "pass" if m is None or m >= L["gpm_min"] else "fail"
     r = snap["roe_annual_avg"]
-    rules["r_roe"] = "pass" if r is None or r >= RULE_ROE_MIN else "fail"
+    rules["r_roe"] = "pass" if r is None or r >= L["roe_min"] else "fail"
     y = snap["rev_yoy"]
-    rules["g_rev"] = "pass" if y is not None and y >= RULE_REV_YOY_MIN else "fail"
+    rules["g_rev"] = "pass" if y is not None and y >= L["rev_yoy_min"] else "fail"
     yp = snap["rev_yoy_prev"]
     rules["g_accel"] = "pass" if y is not None and yp is not None and y >= yp else "fail"
     p = snap["pb_pct"]
-    rules["v_pb"] = "pass" if p is None or p <= RULE_PB_PCT_MAX else "fail"
+    rules["v_pb"] = "pass" if p is None or p <= L["pb_pct_max"] else "fail"
     return rules
 
 

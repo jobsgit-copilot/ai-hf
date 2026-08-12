@@ -4,6 +4,7 @@
 用法：
     python magician_portfolio.py run --events <events.json> --cache <live_cache.pkl> \
         --index <index_000300.pkl> --funnel F1 --regime 0 \
+        # v8 稳健版：--funnel F6F1（F1 + 累计双成长连续两季>0）；可加 --limit-exec 模拟一字涨跌停
         --stop-pct 7 --rr 3 --min-contractions 2 --rs-min 0 --require-dry 1 \
         --risk-pct 1.5 --max-positions 6 --out report.md
 
@@ -320,7 +321,7 @@ def cmd_run(args):
     limits = {}
     for a, k in [("rule_debt_max", "debt_max"), ("rule_ocf_min", "ocf_min"),
                  ("rule_gpm_min", "gpm_min"), ("rule_roe_min", "roe_min"),
-                 ("rule_np_min", "np_yoy_min")]:
+                 ("rule_np_min", "np_yoy_min"), ("rule_dual2_min", "dual2_min")]:
         v = getattr(args, a, None)
         if v is not None:
             limits[k] = v
@@ -413,7 +414,8 @@ def main():
     p.add_argument("--income", default=str(Path(MF.DEFAULT_SQUEEZE) / "finance_income.pkl"))
     p.add_argument("--basic", default=str(Path(MF.DEFAULT_SQUEEZE) / "stock_basic.pkl"))
     p.add_argument("--pb", default=str(Path(MF.DEFAULT_SQUEEZE) / "finance_pb_weekly.pkl"))
-    p.add_argument("--funnel", choices=["F0", "F1", "F2", "F4"], default="F1")
+    p.add_argument("--funnel", choices=["F0", "F1", "F2", "F2N", "F5", "F6", "F6R", "F6B", "F6C",
+                                 "F6F1", "F6F1C", "F7", "F7B", "F3", "F4"], default="F1")
     p.add_argument("--regime", type=int, choices=[0, 1], default=0, help="是否应用环境仓位系数")
     p.add_argument("--breadth-th", type=float, default=0.60)
     p.add_argument("--stop-pct", type=float, default=7.0)
@@ -452,6 +454,8 @@ def main():
     p.add_argument("--rule-gpm-min", type=float, default=None, help="质量红线：毛利率下限%")
     p.add_argument("--rule-roe-min", type=float, default=None, help="质量红线：ROE 下限%")
     p.add_argument("--rule-np-min", type=float, default=None, help="成长：归母净利润同比下限%（第三梯队）")
+    p.add_argument("--rule-dual2-min", type=float, default=None,
+                   help="成长(v8稳健版)：累计口径营收/净利连续两季同比下限%（0 表示>0）")
     p.add_argument("--sector", action="store_true", help="附加板块联动字段（行业归属/动量/共振）")
     p.add_argument("--sector-rs-min", type=float, default=None, help="板块 RS 分位下限（0-100）")
     p.add_argument("--sector-res-min", type=int, default=None, help="板块共振下限（同行业近20日 VCP 标的数）")

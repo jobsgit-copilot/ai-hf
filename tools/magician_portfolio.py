@@ -69,6 +69,12 @@ def _entry_filters(cfg, ev):
         return False
     if cfg["require_dry"] and ev.get("volume_dry") is not True:
         return False
+    srs = cfg.get("sector_rs_min")
+    if srs is not None and (ev.get("sector_rs") is None or ev["sector_rs"] < srs):
+        return False
+    sres = cfg.get("sector_res_min")
+    if sres is not None and (ev.get("sector_n_vcp_20d") is None or ev["sector_n_vcp_20d"] < sres):
+        return False
     return True
 
 
@@ -289,10 +295,15 @@ def cmd_run(args):
                           args.pb if Path(args.pb).exists() else None)
     limits = {}
     for a, k in [("rule_debt_max", "debt_max"), ("rule_ocf_min", "ocf_min"),
-                 ("rule_gpm_min", "gpm_min"), ("rule_roe_min", "roe_min")]:
+                 ("rule_gpm_min", "gpm_min"), ("rule_roe_min", "roe_min"),
+                 ("rule_np_min", "np_yoy_min")]:
         v = getattr(args, a, None)
         if v is not None:
             limits[k] = v
+    if args.sector:
+        from magician_sector import annotate_events as _annotate_sector
+        events = _annotate_sector(events)
+        print("板块字段已附加（--sector）")
     for ev in events:
         ev["funnel"] = MF.funnel_level(MF.apply_rules(db.snapshot(ev["code"], ev["date"]), limits))
     print(f"漏斗标签完成：{time.time()-t0:.0f}s")
@@ -305,7 +316,8 @@ def cmd_run(args):
 
     cfg = {"stop_pct": args.stop_pct, "rr": args.rr, "min_contractions": args.min_contractions,
            "rs_min": args.rs_min, "require_stage2": True, "entry": "breakout", "max_ext": args.max_ext,
-           "require_brv": args.require_brv, "require_dry": not (args.dy_off or args.nody_half)}
+           "require_brv": args.require_brv, "require_dry": not (args.dy_off or args.nody_half),
+           "sector_rs_min": args.sector_rs_min, "sector_res_min": args.sector_res_min}
 
     windows = None
     if args.window_stats:
@@ -415,6 +427,10 @@ def main():
     p.add_argument("--rule-ocf-min", type=float, default=None, help="质量红线：经营现金流/净利润下限")
     p.add_argument("--rule-gpm-min", type=float, default=None, help="质量红线：毛利率下限%")
     p.add_argument("--rule-roe-min", type=float, default=None, help="质量红线：ROE 下限%")
+    p.add_argument("--rule-np-min", type=float, default=None, help="成长：归母净利润同比下限%（第三梯队）")
+    p.add_argument("--sector", action="store_true", help="附加板块联动字段（行业归属/动量/共振）")
+    p.add_argument("--sector-rs-min", type=float, default=None, help="板块 RS 分位下限（0-100）")
+    p.add_argument("--sector-res-min", type=int, default=None, help="板块共振下限（同行业近20日 VCP 标的数）")
     p.add_argument("--max-positions", type=int, default=6)
     p.add_argument("--max-weight", type=float, default=25.0)
     p.add_argument("--horizon", type=int, default=60)

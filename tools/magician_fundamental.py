@@ -29,6 +29,7 @@ RULE_OCF_MIN = 0.7         # 经营现金流/净利润下限
 RULE_GPM_MIN = 15.0        # 长期毛利率下限（%）
 RULE_ROE_MIN = 8.0         # ROE 下限（%，年度均值）
 RULE_REV_YOY_MIN = 15.0    # 营收同比下限（%）
+RULE_NP_YOY_MIN = 25.0    # 归母净利润同比下限（%，第三梯队）
 RULE_PB_PCT_MAX = 90.0     # PB 自身历史分位上限（%）
 
 
@@ -46,6 +47,8 @@ class FundamentalDB:
         t0 = time.time()
         ind = pd.read_pickle(indicator_pkl)
         inc = pd.read_pickle(income_pkl)
+        if "n_income_attr_p" not in inc.columns:
+            inc["n_income_attr_p"] = np.nan
         basic = pd.read_pickle(basic_pkl)
         self._basic = {}
         for r in basic.itertuples(index=False):
@@ -80,6 +83,7 @@ class FundamentalDB:
                 "ann": g["ann_date"].to_numpy(dtype="datetime64[ns]"),
                 "end": g["end_date"].to_numpy(dtype="datetime64[ns]"),
                 "rev": g["revenue"].to_numpy(dtype=float),
+                "np": g["n_income_attr_p"].to_numpy(dtype=float),
             }
 
         self._pb = None
@@ -101,6 +105,7 @@ class FundamentalDB:
                "has_ind": False, "roe_latest": None, "roe_annual_avg": None,
                "gpm_avg": None, "dta_latest": None, "ocf_med": None,
                "has_inc": False, "rev_yoy": None, "rev_yoy_prev": None,
+               "np_yoy": None, "np_yoy_prev": None,
                "is_st": False, "delisted": False, "pb_pct": None}
 
         b = self._basic.get(code)
@@ -146,6 +151,16 @@ class FundamentalDB:
                     y0 = self._rev_at(gi, pprev_end, d)
                     if y1 and y0 and y0 > 0:
                         out["rev_yoy_prev"] = float((y1 / y0 - 1) * 100)
+                # 归母净利润同比（point-in-time，与营收同比同口径）
+                np_cur = self._np_at(gi, last_end, d)
+                np_prev = self._np_at(gi, prev_end, d)
+                if np_cur is not None and np_prev and np_prev > 0:
+                    out["np_yoy"] = float((np_cur / np_prev - 1) * 100)
+                prev_period_end = last_end - np.timedelta64(91, "D")
+                np_pc = self._np_at(gi, prev_period_end, d)
+                np_pp = self._np_at(gi, prev_period_end - np.timedelta64(365, "D"), d)
+                if np_pc is not None and np_pp and np_pp > 0:
+                    out["np_yoy_prev"] = float((np_pc / np_pp - 1) * 100)
 
         gp = self._pb.get(code) if self._pb else None
         if gp is not None:
@@ -169,6 +184,16 @@ class FundamentalDB:
                 return float(v) if v == v else None
         return None
 
+    @staticmethod
+    def _np_at(gi, end, d):
+        end_dates = gi["end"]
+        m = np.nonzero(end_dates == end)[0]
+        for i in m:
+            if gi["ann"][i] <= d:
+                v = gi["np"][i]
+                return float(v) if v == v else None
+        return None
+
 
 def apply_rules(snap, limits=None):
     """返回各规则判定：pass/fail/na。质量红线 na=放行；成长条件 na=不通过。
@@ -177,7 +202,8 @@ def apply_rules(snap, limits=None):
     "roe_min": 6.0, "rev_yoy_min": 15.0, "pb_pct_max": 90.0}（用于第二梯队阈值扫描）。
     """
     L = {"debt_max": RULE_DEBT_MAX, "ocf_min": RULE_OCF_MIN, "gpm_min": RULE_GPM_MIN,
-         "roe_min": RULE_ROE_MIN, "rev_yoy_min": RULE_REV_YOY_MIN, "pb_pct_max": RULE_PB_PCT_MAX}
+         "roe_min": RULE_ROE_MIN, "rev_yoy_min": RULE_REV_YOY_MIN,
+         "np_yoy_min": RULE_NP_YOY_MIN, "pb_pct_max": RULE_PB_PCT_MAX}
     if limits:
         L.update(limits)
     rules = {}
@@ -194,22 +220,30 @@ def apply_rules(snap, limits=None):
     rules["g_rev"] = "pass" if y is not None and y >= L["rev_yoy_min"] else "fail"
     yp = snap["rev_yoy_prev"]
     rules["g_accel"] = "pass" if y is not None and yp is not None and y >= yp else "fail"
+    ny = snap["np_yoy"]
+    rules["g_np"] = "pass" if ny is not None and ny >= L["np_yoy_min"] else "fail"
     p = snap["pb_pct"]
     rules["v_pb"] = "pass" if p is None or p <= L["pb_pct_max"] else "fail"
     return rules
 
 
 def funnel_level(rules):
-    """漏斗分级：F0 全量 / F1 质量红线 / F2 +F1收入同比 / F3 +F2加速 / F4 +F2 PB分位"""
+    """漏斗分级：F0 全量 / F1 质量红线 / F2 +营收同比 / F2N +净利润同比(第三梯队) / F5 双成长 / F3 加速 / F4 PB分位"""
     f1 = all(rules[k] != "fail" for k in ("r_st", "r_debt", "r_ocf", "r_gpm", "r_roe"))
     f2 = f1 and rules["g_rev"] == "pass"
+    f2n = f1 and rules["g_np"] == "pass"
+    f5 = f2 and rules["g_np"] == "pass"
     f3 = f2 and rules["g_accel"] == "pass"
     f4 = f2 and rules["v_pb"] != "fail"
-    return {"F0": True, "F1": f1, "F2": f2, "F3": f3, "F4": f4}
+    return {"F0": True, "F1": f1, "F2": f2, "F2N": f2n, "F5": f5, "F3": f3, "F4": f4}
 
 
 def cmd_funnel(args):
     events = json.loads(Path(args.events).read_text(encoding="utf-8"))
+    if args.sector:
+        from magician_sector import annotate_events as _annotate_sector
+        events = _annotate_sector(events)
+        print("板块字段已附加（--sector）")
     df = MB.load_cache(args.cache)
     arrays = MB.build_arrays(df)
 
@@ -217,12 +251,12 @@ def cmd_funnel(args):
                        args.pb if Path(args.pb).exists() else None)
     t0 = time.time()
     n_rule = {"r_st": 0, "r_debt": 0, "r_ocf": 0, "r_gpm": 0, "r_roe": 0,
-              "g_rev": 0, "g_accel": 0, "v_pb": 0}
+              "g_rev": 0, "g_accel": 0, "g_np": 0, "v_pb": 0}
     n_snap = 0
-    levels = {"F0": 0, "F1": 0, "F2": 0, "F3": 0, "F4": 0}
+    levels = {"F0": 0, "F1": 0, "F2": 0, "F2N": 0, "F5": 0, "F3": 0, "F4": 0}
     for ev in events:
         snap = db.snapshot(ev["code"], ev["date"])
-        rules = apply_rules(snap)
+        rules = apply_rules(snap, {"np_yoy_min": args.np_min})
         ev["snap"] = snap
         ev["funnel"] = funnel_level(rules)
         n_snap += 1
@@ -234,7 +268,7 @@ def cmd_funnel(args):
     print(f"  各规则通过率：" + "  ".join(f"{k}={n_rule[k]}/{n_snap} ({n_rule[k]/max(1,n_snap)*100:.0f}%)" for k in n_rule))
     print(f"  漏斗分级通过：" + "  ".join(f"{k}={v}" for k, v in levels.items()))
 
-    groups = {k: [e for e in events if e["funnel"][k]] for k in ("F0", "F1", "F2", "F3", "F4")}
+    groups = {k: [e for e in events if e["funnel"][k]] for k in ("F0", "F1", "F2", "F2N", "F5", "F3", "F4")}
     configs = []
     for stop_pct in args.stops:
         for rr in args.rrs:
@@ -267,6 +301,11 @@ def cmd_funnel(args):
         exp = "-" if r["expectancy_pct"] is None else f"{r['expectancy_pct']:>8.2f}"
         print(f"{r['level']:<6}{r['config']:<38}{r['n']:>6}{str(r['win_rate']):>7}{str(r['avg_win']):>7}"
               f"{str(r['avg_loss']):>7}{exp}{str(r['median_outcome']):>8}{str(r['hit20_rate']):>7}")
+
+    if getattr(args, "out_enriched", ""):
+        Path(args.out_enriched).write_text(
+            json.dumps(events, ensure_ascii=False), encoding="utf-8")
+        print(f"富化事件已保存: {args.out_enriched}")
 
     if args.out:
         out_path = Path(args.out)
@@ -309,10 +348,13 @@ def main():
     p.add_argument("--rs-min-list", type=float, nargs="+", default=[0.0])
     p.add_argument("--brv", type=int, nargs="+", choices=[0, 1], default=[0])
     p.add_argument("--dry", type=int, nargs="+", choices=[0, 1], default=[0, 1])
+    p.add_argument("--np-min", type=float, default=RULE_NP_YOY_MIN, help="归母净利润同比下限（第三梯队，默认25%）")
     p.add_argument("--horizon", type=int, default=60)
     p.add_argument("--json", action="store_true")
     p.add_argument("--out", default="")
     p.add_argument("--start-hint", default="2020-01~2026-08，日度评估")
+    p.add_argument("--sector", action="store_true", help="附加板块联动字段（magician_sector）")
+    p.add_argument("--out-enriched", default="", help="保存富化事件 JSON（snap/funnel/板块）")
     p.set_defaults(func=cmd_funnel)
     args = parser.parse_args()
     args.func(args)

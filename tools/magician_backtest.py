@@ -308,6 +308,12 @@ def measure(events, arrays, config, horizon=60, target20=0.20):
                 continue
             if require_dry and ev.get("volume_dry") is not True:
                 continue
+            srs = config.get("sector_rs_min")
+            if srs is not None and (ev.get("sector_rs") is None or ev["sector_rs"] < srs):
+                continue
+            sres = config.get("sector_res_min")
+            if sres is not None and (ev.get("sector_n_vcp_20d") is None or ev["sector_n_vcp_20d"] < sres):
+                continue
         else:  # setup：接近中枢点（95%-100%）
             if ev["status"] not in ("setup", "breakout"):
                 continue
@@ -395,10 +401,15 @@ def summarize(trades):
 # ---------------------------------------------------------------- 引擎与 CLI
 
 def _config_label(cfg):
-    return (f"stop{cfg['stop_pct']}%_rr{cfg['rr']}_mc{cfg.get('min_contractions', 2)}"
-            f"_rs{cfg.get('rs_min', 0)}_s2{int(cfg.get('require_stage2', True))}"
-            f"_x{int(round(cfg.get('max_ext', 0.15) * 100))}_bv{int(cfg.get('require_brv', False))}"
-            f"_dy{int(cfg.get('require_dry', False))}_{cfg.get('entry', 'breakout')}")
+    label = (f"stop{cfg['stop_pct']}%_rr{cfg['rr']}_mc{cfg.get('min_contractions', 2)}"
+             f"_rs{cfg.get('rs_min', 0)}_s2{int(cfg.get('require_stage2', True))}"
+             f"_x{int(round(cfg.get('max_ext', 0.15) * 100))}_bv{int(cfg.get('require_brv', False))}"
+             f"_dy{int(cfg.get('require_dry', False))}_{cfg.get('entry', 'breakout')}")
+    if cfg.get("sector_rs_min") is not None:
+        label += f"_srs{cfg['sector_rs_min']:.0f}"
+    if cfg.get("sector_res_min") is not None:
+        label += f"_sres{cfg['sector_res_min']:.0f}"
+    return label
 
 
 def run_engine(events, arrays, configs, horizon=60):

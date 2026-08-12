@@ -271,7 +271,11 @@ def apply_rules(snap, limits=None):
     # 第四梯队：双成长连续两季度（营收/归母净利润当季与上一季同比均为正）
     rv0, rv1 = snap["rev_yoy"], snap["rev_yoy_prev"]
     np0, np1 = snap["np_yoy"], snap["np_yoy_prev"]
-    dual2 = all(v is not None and v > 0 for v in (rv0, rv1, np0, np1))
+    dth = L.get("dual2_min", 0.0)
+    if dth > 0:
+        dual2 = all(v is not None and v >= dth for v in (rv0, rv1, np0, np1))
+    else:
+        dual2 = all(v is not None and v > 0 for v in (rv0, rv1, np0, np1))
     rules["g_dual2"] = "pass" if dual2 else "fail"
     rules["g_dual2_15"] = "pass" if all(v is not None and v >= 15.0 for v in (rv0, rv1, np0, np1)) else "fail"
     rules["g_dual1"] = "pass" if all(v is not None and v > 0 for v in (rv0, np0)) else "fail"
@@ -289,6 +293,7 @@ def funnel_level(rules):
     """漏斗分级：F0 全量 / F1 质量红线 / F2 +营收同比 / F2N +净利润同比(第三梯队) / F5 双成长 /
     F6 双成长连续2季>0(忽略全部F1) / F6R 同F6保留r_st / F6B 双成长连续2季≥15% / F6C 仅当季双成长>0 /
     F7 F1+单季双成长连续2季>0 / F7B F1+单季双成长连续2季≥15% / F6F1 F1+累计双成长连续2季>0 /
+    F6F1C F1+仅当季累计双成长>0(上一季开关关) /
     F3 加速 / F4 PB分位"""
     f1 = all(rules[k] != "fail" for k in ("r_st", "r_debt", "r_ocf", "r_gpm", "r_roe"))
     f2 = f1 and rules["g_rev"] == "pass"
@@ -303,9 +308,11 @@ def funnel_level(rules):
     f7 = f1 and rules["g_sqdual2"] == "pass"
     f7b = f1 and rules["g_sqdual2_15"] == "pass"
     f6f1 = f1 and rules["g_dual2"] == "pass"
+    f6f1c = f1 and rules["g_dual1"] == "pass"
     return {"F0": True, "F1": f1, "F2": f2, "F2N": f2n, "F5": f5,
             "F6": f6, "F6R": f6r, "F6B": f6b, "F6C": f6c,
-            "F7": f7, "F7B": f7b, "F6F1": f6f1, "F3": f3, "F4": f4}
+            "F7": f7, "F7B": f7b, "F6F1": f6f1, "F6F1C": f6f1c,
+            "F3": f3, "F4": f4}
 
 
 def cmd_funnel(args):

@@ -78,11 +78,27 @@ def _entry_filters(cfg, ev):
     return True
 
 
+def _is_limit_one_word(arr, i, code, down):
+    """判断第 i 根日线是否一字涨/跌停（o==l==h==c 且触及涨跌停价）。
+    主板近似 10%（ST 5% 未单列），创业板 300/科创板 688 为 20%。"""
+    if i <= 0:
+        return False
+    o, h, l, c = arr[1][i], arr[2][i], arr[3][i], arr[4][i]
+    if max(o, h, l, c) - min(o, h, l, c) > 1e-9:
+        return False
+    prev = arr[4][i - 1]
+    if prev <= 0:
+        return False
+    limit = 0.195 if code[:3] in ("300", "688") else 0.095
+    pct = c / prev - 1.0
+    return (pct <= -limit * 0.98) if down else (pct >= limit * 0.98)
+
+
 def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5,
              max_positions=6, max_weight=25.0, horizon=60, breadth_th=0.6, full_invest=False,
              lockout=LOCKOUT, mc2_half=False, nody_half=False, regime_down=0.5,
              friction=0.0, rs_priority=False, windows=None,
-             protect_be=None, trail80=False, no_target=False):
+             protect_be=None, trail80=False, no_target=False, limit_exec=False):
     """事件驱动的组合模拟。返回结果字典。"""
     f_side = friction / 2.0
     # 交易日历：限制在事件区间内（避免 2018-2019 空转稀释 CAGR）
@@ -111,6 +127,7 @@ def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5
     exposure_curve = []
     skipped_capacity = 0
     skipped_lockout = 0
+    skipped_limit = 0
 
     def mark_to_market(day_i):
         nonlocal cash
@@ -161,6 +178,9 @@ def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5
             else:
                 p.exit_day = None
                 continue
+            if limit_exec and _is_limit_one_word(arr, i, p.code, down=True):
+                p.exit_day = None
+                continue
             exit_fill = exit_price * (1 - f_side)
             cash += p.shares * exit_fill
             trades.append({"code": p.code, "entry_date": str(p.entry_date)[:10], "exit_date": str(day)[:10],
@@ -205,10 +225,13 @@ def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5
             if cash < cost:
                 skipped_capacity += 1
                 continue
-            fill = entry * (1 + f_side)
-            shares = cost / fill
             arr = arrays[code]
             i = int(np.searchsorted(arr[0], day, side="right") - 1)
+            if limit_exec and _is_limit_one_word(arr, i, code, down=False):
+                skipped_limit += 1
+                continue
+            fill = entry * (1 + f_side)
+            shares = cost / fill
             target = entry + cfg["rr"] * (entry - stop)
             positions.append(Position(code, day, fill, stop, target, shares, w, i))
             last_entry[code] = day_i
@@ -236,6 +259,7 @@ def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5
 
     eq = pd.Series([v for _, v in equity_curve], index=[d for d, _ in equity_curve])
     res = summarize_portfolio(eq, trades, exposure_curve, skipped_capacity, skipped_lockout, cfg, funnel_level)
+    res["skipped_limit"] = skipped_limit
     res["equity"] = [[str(d)[:10], round(float(v), 4)] for d, v in zip(eq.index[::5], eq.values[::5])]
     res["exposure"] = [[str(d)[:10], round(float(v), 4)] for d, v in zip(eq.index[::5], exposure_curve[::5])]
     if windows:

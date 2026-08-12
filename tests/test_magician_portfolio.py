@@ -117,6 +117,39 @@ class TestSimulate(unittest.TestCase):
         res1 = MP.simulate([ev], arrays, CFG, funnel_level="F1", regime_mode=1)
         self.assertAlmostEqual(res1["avg_exposure"], res0["avg_exposure"] / 2, delta=1.0)
 
+    def test_nody_half_lets_non_dy_in_at_half_weight(self):
+        arrays = make_arrays()
+        ramp_after("TEST.SH", arrays, up=True)
+        ev = base_event()
+        ev["volume_dry"] = False
+        res_on = MP.simulate([ev, dummy_event()], arrays, dict(CFG, require_dry=True), funnel_level="F1")
+        self.assertEqual(res_on["n_trades"], 0)  # dy 硬过滤排除
+        res = MP.simulate([ev, dummy_event()], arrays, dict(CFG, require_dry=False),
+                          funnel_level="F1", nody_half=True)
+        self.assertEqual(res["n_trades"], 1)
+        self.assertAlmostEqual(res["trades"][0]["weight"], 0.2143 * 0.5, delta=0.01)
+
+    def test_mc2_half_halves_weight(self):
+        arrays = make_arrays()
+        ramp_after("TEST.SH", arrays, up=True)
+        ev = base_event()
+        ev["n_contractions"] = 2
+        cfg2 = dict(CFG, min_contractions=2)
+        res_full = MP.simulate([ev, dummy_event()], arrays, cfg2, funnel_level="F1")
+        res_half = MP.simulate([ev, dummy_event()], arrays, cfg2, funnel_level="F1", mc2_half=True)
+        self.assertEqual(res_half["n_trades"], 1)
+        self.assertAlmostEqual(res_half["trades"][0]["weight"], res_full["trades"][0]["weight"] / 2, delta=0.01)
+
+    def test_lockout_param_controls_reentry(self):
+        arrays = make_arrays()
+        ramp_after("TEST.SH", arrays, up=False)  # 第一笔约8日止损出场
+        ev1 = base_event(date="2026-01-05")
+        ev2 = base_event(date="2026-03-05")  # 间隔约42交易日
+        res80 = MP.simulate([ev1, ev2, dummy_event()], arrays, CFG, funnel_level="F1")
+        res40 = MP.simulate([ev1, ev2, dummy_event()], arrays, CFG, funnel_level="F1", lockout=40)
+        self.assertEqual(res80["n_trades"], 1)  # 80日锁仓拦截
+        self.assertEqual(res40["n_trades"], 2)  # 40日锁仓放行
+
 
 class TestSummarizePortfolio(unittest.TestCase):
     def test_empty(self):

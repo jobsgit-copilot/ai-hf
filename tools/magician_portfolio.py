@@ -70,7 +70,8 @@ def _entry_filters(cfg, ev):
 
 
 def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5,
-             max_positions=6, max_weight=25.0, horizon=60, breadth_th=0.6, full_invest=False):
+             max_positions=6, max_weight=25.0, horizon=60, breadth_th=0.6, full_invest=False,
+             lockout=LOCKOUT, mc2_half=False, nody_half=False):
     """事件驱动的组合模拟。返回结果字典。"""
     # 交易日历：限制在事件区间内（避免 2018-2019 空转稀释 CAGR）
     ev_dates = np.sort(np.unique(np.array([e["date"] for e in events], dtype="datetime64[ns]")))
@@ -147,7 +148,7 @@ def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5
                 continue
             if any(p.code == code for p in positions):
                 continue
-            if code in last_entry and day_i - last_entry[code] < LOCKOUT:
+            if code in last_entry and day_i - last_entry[code] < lockout:
                 skipped_lockout += 1
                 continue
             stop = max(ev["pivot"] * (1 - cfg["stop_pct"] / 100.0), ev["base_low"] or ev["pivot"] * 0.9)
@@ -167,6 +168,10 @@ def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5
             if regime_mode:
                 coeff = 1.0 if (ev.get("idx_above_ma200") and (ev.get("breadth") or 0) >= breadth_th) else                         (0.8 if ev.get("idx_above_ma200") else 0.5)
                 w *= coeff
+            if mc2_half and ev.get("n_contractions", 0) < 3:
+                w *= 0.5
+            if nody_half and ev.get("volume_dry") is not True:
+                w *= 0.5
             cost = w * equity_now
             if cash < cost:
                 skipped_capacity += 1
@@ -255,12 +260,13 @@ def cmd_run(args):
 
     cfg = {"stop_pct": args.stop_pct, "rr": args.rr, "min_contractions": args.min_contractions,
            "rs_min": args.rs_min, "require_stage2": True, "entry": "breakout", "max_ext": 0.15,
-           "require_brv": args.require_brv, "require_dry": args.require_dry}
+           "require_brv": args.require_brv, "require_dry": not (args.dy_off or args.nody_half)}
 
     res = simulate(events, arrays, cfg, funnel_level=args.funnel, regime_mode=args.regime,
                    risk_pct=args.risk_pct, max_positions=args.max_positions,
                    max_weight=args.max_weight, horizon=args.horizon, breadth_th=args.breadth_th,
-                   full_invest=args.full_invest)
+                   full_invest=args.full_invest, lockout=args.lockout,
+                   mc2_half=args.mc2_half, nody_half=args.nody_half)
 
     if args.json:
         out = {k: v for k, v in res.items() if k != "trades"}
@@ -329,6 +335,12 @@ def main():
     p.add_argument("--risk-pct", type=float, default=1.5)
     p.add_argument("--full-invest", action="store_true", default=False,
                    help="满仓模式：新仓按可用现金尽量配到单只上限，不保留现金")
+    p.add_argument("--lockout", type=int, default=LOCKOUT, help="同标的两次建仓最小间隔（交易日）")
+    p.add_argument("--dy-off", action="store_true", default=False, help="关闭量能萎缩硬过滤（所有事件可入）")
+    p.add_argument("--mc2-half", action="store_true", default=False,
+                   help="混仓：n_contractions==2 的事件仓位减半（配合 --min-contractions 2）")
+    p.add_argument("--nody-half", action="store_true", default=False,
+                   help="量能分级：无量能萎缩事件仓位减半（同时关闭 dy 硬过滤）")
     p.add_argument("--max-positions", type=int, default=6)
     p.add_argument("--max-weight", type=float, default=25.0)
     p.add_argument("--horizon", type=int, default=60)

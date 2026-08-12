@@ -86,6 +86,20 @@ class FundamentalDB:
                 "np": g["n_income_attr_p"].to_numpy(dtype=float),
             }
 
+        # 报表期映射：_prev=上一期(本财年前一期)，_yoy=去年同期(同月同日)
+        for c, gi in self._inc.items():
+            ends = np.unique(gi["end"])
+            prev, yoy = {}, {}
+            for e in ends:
+                pos = int(np.searchsorted(ends, e, side="left")) - 1
+                prev[e] = ends[pos] if pos >= 0 else None
+                dt = pd.Timestamp(e)
+                target = np.datetime64(pd.Timestamp(dt.year - 1, dt.month, dt.day))
+                m = np.nonzero(ends == target)[0]
+                yoy[e] = ends[m[0]] if len(m) else None
+            gi["_prev"] = prev
+            gi["_yoy"] = yoy
+
         self._pb = None
         if pb_pkl:
             pb = pd.read_pickle(pb_pkl)
@@ -131,36 +145,21 @@ class FundamentalDB:
 
         gi = self._inc.get(code)
         if gi is not None:
-            ann, end, rev = gi["ann"], gi["end"], gi["rev"]
+            ann, end = gi["ann"], gi["end"]
             cand = np.nonzero(ann <= d)[0]
             if len(cand):
                 # 最新已披露报表期
                 li = cand[np.argmax(end[cand])]
                 out["has_inc"] = True
                 last_end = end[li]
-                prev_end = last_end - np.timedelta64(365, "D")
-                pprev_end = last_end - np.timedelta64(730, "D")
-                yoy = self._rev_at(gi, last_end, d)
-                yoy_prev_end = last_end - np.timedelta64(91, "D")
-                if yoy is not None:
-                    y0 = self._rev_at(gi, prev_end, d)
-                    if y0 and y0 > 0:
-                        out["rev_yoy"] = float((yoy / y0 - 1) * 100)
-                if out["rev_yoy"] is not None:
-                    y1 = self._rev_at(gi, yoy_prev_end, d)
-                    y0 = self._rev_at(gi, pprev_end, d)
-                    if y1 and y0 and y0 > 0:
-                        out["rev_yoy_prev"] = float((y1 / y0 - 1) * 100)
-                # 归母净利润同比（point-in-time，与营收同比同口径）
-                np_cur = self._np_at(gi, last_end, d)
-                np_prev = self._np_at(gi, prev_end, d)
-                if np_cur is not None and np_prev and np_prev > 0:
-                    out["np_yoy"] = float((np_cur / np_prev - 1) * 100)
-                prev_period_end = last_end - np.timedelta64(91, "D")
-                np_pc = self._np_at(gi, prev_period_end, d)
-                np_pp = self._np_at(gi, prev_period_end - np.timedelta64(365, "D"), d)
-                if np_pc is not None and np_pp and np_pp > 0:
-                    out["np_yoy_prev"] = float((np_pc / np_pp - 1) * 100)
+                # 用报表期映射取“上一期”与“去年同期”，避免日期减法漂移（闰年/年报期）
+                prev = gi["_prev"].get(last_end) if "_prev" in gi else None
+                yoy_end = gi["_yoy"].get(last_end) if "_yoy" in gi else None
+                prev_yoy = gi["_yoy"].get(prev) if (prev is not None and "_yoy" in gi) else None
+                out["rev_yoy"] = self._pct_yoy(gi, last_end, yoy_end, d, "rev")
+                out["rev_yoy_prev"] = self._pct_yoy(gi, prev, prev_yoy, d, "rev")
+                out["np_yoy"] = self._pct_yoy(gi, last_end, yoy_end, d, "np")
+                out["np_yoy_prev"] = self._pct_yoy(gi, prev, prev_yoy, d, "np")
 
         gp = self._pb.get(code) if self._pb else None
         if gp is not None:
@@ -183,6 +182,18 @@ class FundamentalDB:
                 v = gi["rev"][i]
                 return float(v) if v == v else None
         return None
+
+    @staticmethod
+    def _pct_yoy(gi, cur, yoy, d, kind):
+        """cur 期相对去年同期(同月同日)的同比增幅%；任一端缺失/去年基数非正返回 None。"""
+        if cur is None or yoy is None:
+            return None
+        fn = FundamentalDB._rev_at if kind == "rev" else FundamentalDB._np_at
+        vc = fn(gi, cur, d)
+        vb = fn(gi, yoy, d)
+        if vc is None or vb is None or vb <= 0:
+            return None
+        return float((vc / vb - 1) * 100)
 
     @staticmethod
     def _np_at(gi, end, d):
@@ -222,20 +233,34 @@ def apply_rules(snap, limits=None):
     rules["g_accel"] = "pass" if y is not None and yp is not None and y >= yp else "fail"
     ny = snap["np_yoy"]
     rules["g_np"] = "pass" if ny is not None and ny >= L["np_yoy_min"] else "fail"
+    # 第四梯队：双成长连续两季度（营收/归母净利润当季与上一季同比均为正）
+    rv0, rv1 = snap["rev_yoy"], snap["rev_yoy_prev"]
+    np0, np1 = snap["np_yoy"], snap["np_yoy_prev"]
+    dual2 = all(v is not None and v > 0 for v in (rv0, rv1, np0, np1))
+    rules["g_dual2"] = "pass" if dual2 else "fail"
+    rules["g_dual2_15"] = "pass" if all(v is not None and v >= 15.0 for v in (rv0, rv1, np0, np1)) else "fail"
+    rules["g_dual1"] = "pass" if all(v is not None and v > 0 for v in (rv0, np0)) else "fail"
     p = snap["pb_pct"]
     rules["v_pb"] = "pass" if p is None or p <= L["pb_pct_max"] else "fail"
     return rules
 
 
 def funnel_level(rules):
-    """漏斗分级：F0 全量 / F1 质量红线 / F2 +营收同比 / F2N +净利润同比(第三梯队) / F5 双成长 / F3 加速 / F4 PB分位"""
+    """漏斗分级：F0 全量 / F1 质量红线 / F2 +营收同比 / F2N +净利润同比(第三梯队) / F5 双成长 /
+    F6 双成长连续2季>0(忽略全部F1) / F6R 同F6保留r_st / F6B 双成长连续2季≥15% / F6C 仅当季双成长>0 /
+    F3 加速 / F4 PB分位"""
     f1 = all(rules[k] != "fail" for k in ("r_st", "r_debt", "r_ocf", "r_gpm", "r_roe"))
     f2 = f1 and rules["g_rev"] == "pass"
     f2n = f1 and rules["g_np"] == "pass"
     f5 = f2 and rules["g_np"] == "pass"
     f3 = f2 and rules["g_accel"] == "pass"
     f4 = f2 and rules["v_pb"] != "fail"
-    return {"F0": True, "F1": f1, "F2": f2, "F2N": f2n, "F5": f5, "F3": f3, "F4": f4}
+    f6 = rules["g_dual2"] == "pass"
+    f6r = f6 and rules["r_st"] != "fail"
+    f6b = rules["g_dual2_15"] == "pass"
+    f6c = rules["g_dual1"] == "pass"
+    return {"F0": True, "F1": f1, "F2": f2, "F2N": f2n, "F5": f5,
+            "F6": f6, "F6R": f6r, "F6B": f6b, "F6C": f6c, "F3": f3, "F4": f4}
 
 
 def cmd_funnel(args):

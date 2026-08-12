@@ -71,8 +71,10 @@ def _entry_filters(cfg, ev):
 
 def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5,
              max_positions=6, max_weight=25.0, horizon=60, breadth_th=0.6, full_invest=False,
-             lockout=LOCKOUT, mc2_half=False, nody_half=False, regime_down=0.5):
+             lockout=LOCKOUT, mc2_half=False, nody_half=False, regime_down=0.5,
+             friction=0.0, rs_priority=False, windows=None):
     """事件驱动的组合模拟。返回结果字典。"""
+    f_side = friction / 2.0
     # 交易日历：限制在事件区间内（避免 2018-2019 空转稀释 CAGR）
     ev_dates = np.sort(np.unique(np.array([e["date"] for e in events], dtype="datetime64[ns]")))
     d0, d1 = ev_dates[0], ev_dates[-1]
@@ -83,7 +85,10 @@ def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5
     fev = [e for e in events if e["funnel"].get(funnel_level)]
     if regime_mode:
         fev = [e for e in fev if e["regime"] is not None]
-    fev.sort(key=lambda e: (e["date"], e["code"]))
+    if rs_priority:
+        fev.sort(key=lambda e: (e["date"], -float(e.get("rs") or 0.0), e["code"]))
+    else:
+        fev.sort(key=lambda e: (e["date"], e["code"]))
     ev_by_day = {}
     for e in fev:
         ev_by_day.setdefault(e["date"], []).append(e)
@@ -133,10 +138,11 @@ def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5
             else:
                 p.exit_day = None
                 continue
-            cash += p.shares * exit_price
+            exit_fill = exit_price * (1 - f_side)
+            cash += p.shares * exit_fill
             trades.append({"code": p.code, "entry_date": str(p.entry_date)[:10], "exit_date": str(day)[:10],
-                           "entry": p.entry_price, "exit": exit_price, "weight": p.weight,
-                           "outcome_pct": (exit_price / p.entry_price - 1) * 100,
+                           "entry": p.entry_price, "exit": exit_fill, "weight": p.weight,
+                           "outcome_pct": (exit_fill / p.entry_price - 1) * 100,
                            "exit_day": p.exit_day, "reason": reason, "hit20": p.hit20})
             positions.remove(p)
 
@@ -176,11 +182,12 @@ def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5
             if cash < cost:
                 skipped_capacity += 1
                 continue
-            shares = cost / entry
+            fill = entry * (1 + f_side)
+            shares = cost / fill
             arr = arrays[code]
             i = int(np.searchsorted(arr[0], day, side="right") - 1)
             target = entry + cfg["rr"] * (entry - stop)
-            positions.append(Position(code, day, entry, stop, target, shares, w, i))
+            positions.append(Position(code, day, fill, stop, target, shares, w, i))
             last_entry[code] = day_i
             cash -= cost
 
@@ -196,10 +203,11 @@ def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5
         arr = arrays[p.code]
         i = min(p.entry_i + horizon, len(arr[0]) - 1)
         price = arr[4][i]
-        cash += p.shares * price
+        exit_fill = price * (1 - f_side)
+        cash += p.shares * exit_fill
         trades.append({"code": p.code, "entry_date": str(p.entry_date)[:10], "exit_date": str(arr[0][i])[:10],
-                       "entry": p.entry_price, "exit": price, "weight": p.weight,
-                       "outcome_pct": (price / p.entry_price - 1) * 100,
+                       "entry": p.entry_price, "exit": exit_fill, "weight": p.weight,
+                       "outcome_pct": (exit_fill / p.entry_price - 1) * 100,
                        "exit_day": i - p.entry_i, "reason": "end", "hit20": p.hit20})
         positions.remove(p)
 
@@ -207,6 +215,15 @@ def simulate(events, arrays, cfg, funnel_level="F1", regime_mode=0, risk_pct=1.5
     res = summarize_portfolio(eq, trades, exposure_curve, skipped_capacity, skipped_lockout, cfg, funnel_level)
     res["equity"] = [[str(d)[:10], round(float(v), 4)] for d, v in zip(eq.index[::5], eq.values[::5])]
     res["exposure"] = [[str(d)[:10], round(float(v), 4)] for d, v in zip(eq.index[::5], exposure_curve[::5])]
+    if windows:
+        res["windows"] = {}
+        for a, b in windows:
+            sub = eq[(eq.index >= a) & (eq.index <= b)]
+            if len(sub) >= 2:
+                net = float(sub.iloc[-1] / sub.iloc[0])
+                cagr = (net ** (252.0 / len(sub)) - 1) * 100
+                dd = float((sub / sub.cummax() - 1).min()) * 100
+                res["windows"][f"{a}~{b}"] = {"net": round(net, 3), "cagr": round(cagr, 2), "max_dd": round(dd, 2)}
     return res
 
 
@@ -273,11 +290,15 @@ def cmd_run(args):
            "rs_min": args.rs_min, "require_stage2": True, "entry": "breakout", "max_ext": args.max_ext,
            "require_brv": args.require_brv, "require_dry": not (args.dy_off or args.nody_half)}
 
+    windows = None
+    if args.window_stats:
+        windows = [tuple(part.split(",")) for part in args.window_stats.split(";") if "," in part]
     res = simulate(events, arrays, cfg, funnel_level=args.funnel, regime_mode=args.regime,
                    risk_pct=args.risk_pct, max_positions=args.max_positions,
                    max_weight=args.max_weight, horizon=args.horizon, breadth_th=args.breadth_th,
                    full_invest=args.full_invest, lockout=args.lockout,
-                   mc2_half=args.mc2_half, nody_half=args.nody_half, regime_down=args.regime_down)
+                   mc2_half=args.mc2_half, nody_half=args.nody_half, regime_down=args.regime_down,
+                   friction=args.friction, rs_priority=args.rs_priority, windows=windows)
 
     if args.json:
         out = {k: v for k, v in res.items() if k != "trades"}
@@ -292,6 +313,10 @@ def cmd_run(args):
           f"平均暴露 {res['avg_exposure']}%  现金占比 {100 - res['avg_exposure']:.1f}%  "
           f"有持仓天数 {res['pct_days_invested']:.0f}%  容量跳过 {res['skipped_capacity']}")
     print("分年收益: " + "  ".join(f"{y}={v:.1f}%" for y, v in sorted(res["annual"].items())))
+    if res.get("windows"):
+        print("分段统计: " + "  ".join(
+            f"{k} 净值{v['net']:.2f} CAGR {v['cagr']:.1f}% 回撤{v['max_dd']:.1f}%"
+            for k, v in res["windows"].items()))
 
     if args.out:
         mode = "满仓" if args.full_invest else "风险平价"
@@ -354,6 +379,12 @@ def main():
                    help="量能分级：无量能萎缩事件仓位减半（同时关闭 dy 硬过滤）")
     p.add_argument("--max-ext", type=float, default=0.15, help="突破追高上限（entry/pivot-1 上限）")
     p.add_argument("--regime-down", type=float, default=0.5, help="弱市环境仓位系数")
+    p.add_argument("--friction", type=float, default=0.0,
+                   help="双边摩擦成本（手续费+滑点）比例，如 0.005=0.5%")
+    p.add_argument("--rs-priority", action="store_true", default=False,
+                   help="同日多信号按 RS 降序优先入场（领头羊优先）")
+    p.add_argument("--window-stats", default="",
+                   help="净值分段统计：逗号分隔起止、分号分隔多段，如 2020-01-01,2023-12-31;2024-01-01,2026-08-12")
     p.add_argument("--start", default="", help="事件起始日期（YYYY-MM-DD，含）")
     p.add_argument("--end", default="", help="事件截止日期（YYYY-MM-DD，含）")
     p.add_argument("--rule-debt-max", type=float, default=None, help="质量红线：资产负债率上限%")

@@ -150,6 +150,29 @@ class TestSimulate(unittest.TestCase):
         self.assertEqual(res80["n_trades"], 1)  # 80日锁仓拦截
         self.assertEqual(res40["n_trades"], 2)  # 40日锁仓放行
 
+    def test_friction_reduces_returns(self):
+        arrays = make_arrays()
+        ramp_after("TEST.SH", arrays, up=True)
+        res0 = MP.simulate([base_event(), dummy_event()], arrays, CFG, funnel_level="F1")
+        res1 = MP.simulate([base_event(), dummy_event()], arrays, CFG, funnel_level="F1", friction=0.01)
+        self.assertLess(res1["final"], res0["final"])
+        self.assertLess(res1["trades"][0]["outcome_pct"], 21.0)  # 摩擦吃掉一部分利润
+
+    def test_rs_priority_picks_leader(self):
+        arrays = make_arrays("AAA.SH")
+        arrays.update(make_arrays("BBB.SH"))
+        for code in arrays:
+            ramp_after(code, arrays, up=True)
+        ev_a = base_event("AAA.SH")
+        ev_a["rs"] = 50.0
+        ev_b = base_event("BBB.SH")
+        ev_b["rs"] = 90.0
+        res_pri = MP.simulate([ev_a, ev_b], arrays, CFG, funnel_level="F1", max_positions=1, rs_priority=True)
+        res_def = MP.simulate([ev_a, ev_b], arrays, CFG, funnel_level="F1", max_positions=1)
+        self.assertEqual(res_pri["n_trades"], 1)
+        self.assertEqual(res_pri["trades"][0]["code"], "BBB.SH")  # RS 高的领头羊先进
+        self.assertEqual(res_def["trades"][0]["code"], "AAA.SH")  # 默认按代码序
+
 
 class TestSummarizePortfolio(unittest.TestCase):
     def test_empty(self):
